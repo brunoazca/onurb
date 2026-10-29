@@ -13,11 +13,14 @@
 
 Pressing the button, or doing the trained gesture, **opens a conversation with my assistant**. The assistant can act on my behalf: reading mail, managing my calendar, keeping a shopping list and ordering it on Fridays with my permission, orchestrating code work in my herdr workspaces, and more. Recording mode feeds meetings and memos into the same assistant.
 
+**wacli plays two roles.** It is (1) a transport for reaching Instinct, and (2) a context source in its own right: it can read my conversations with other people, which **Instinct does not have**. Questions like "what did Ana say about Saturday?" or "remind me what I promised the contractor" depend on that second role.
+
 The watch stays a thin client. It knows only the two HTTP contracts in SPEC §9 and §10.5, so everything in this document can change without reflashing the watch.
 
 ```
  Watch ──HTTPS──► Cloudflare tunnel ──► Onurb Gateway ──► Brain adapter ──► (A) Instinct via wacli
  (Turn API,        (Access service       ├ STT                             └► (B) Onurb Agent ──► skills/tools
+  Recordings API)   token auth)          ├ TTS → 24 kHz s16                                     ├ conversations (wacli)
   Recordings API)   token auth)          ├ TTS → 24 kHz s16                                     ├ mail, calendar
                                          ├ sessions + inbox                                      ├ shopping list
                                          └ recordings → transcript                               ├ herdr (code)
@@ -37,6 +40,7 @@ Instinct is the assistant I already use. It is good at managing things and alrea
 |---|---|
 | Fastest path to a working watch-to-assistant loop | Speed and abilities are capped by Instinct and the messaging hop |
 | Reuses everything Instinct already does (including herdr access) | Matching a reply to the right watch turn depends on what wacli supports (§8 Q1) |
+| | Instinct can't see my conversations with other people, so this option leaves wacli's best context unused |
 | No new agent to secure or maintain | Replies are written for chat, not speech; may need rewriting for TTS |
 
 ### Option B: a dedicated Onurb agent
@@ -45,7 +49,8 @@ A purpose-built agent with its own context and skills (§4). It runs on Claude t
 
 | Pros | Cons |
 |---|---|
-| Voice-first replies, low latency, sessions designed for the watch | More to build, host and secure |
+| Uses wacli directly as a context source: my conversations with other people, which Instinct lacks | More to build, host and secure |
+| Voice-first replies, low latency, sessions designed for the watch | Reading other people's messages widens the injection and privacy surface (§5) |
 | Full control over context, skills, permissions and audit | Needs a careful security model (§5), especially for money and secrets |
 | Can run long tasks and report back through the watch inbox | |
 
@@ -104,7 +109,7 @@ Which brain is used is a gateway setting, so A and B can be compared side by sid
   - a fast model for spoken turns (target: first audio within a few seconds)
   - a stronger model for planning, long tasks and recording summaries
   - Current Claude family IDs: `claude-haiku-5-5`, `claude-sonnet-5-5`, `claude-opus-5-5`. Choose by measurement, not upfront.
-- **Context:** a persistent profile (preferences, people, places), recent conversation, relevant mail/calendar items fetched on demand, and recording summaries. Fetching on demand beats stuffing everything into every prompt, for both cost and privacy.
+- **Context:** a persistent profile (preferences, people, places), recent conversation with Onurb, relevant mail/calendar items and **my conversations with other people via wacli**, all fetched on demand, plus recording summaries. Together, conversations and meeting recordings give the agent what was actually said and promised, which neither Instinct nor mail alone covers. Fetching on demand beats stuffing everything into every prompt, for both cost and privacy.
 
 ### 4.2 Permission tiers
 
@@ -122,6 +127,7 @@ Voice alone never authorises T3. Anyone holding the watch can talk to it.
 
 | Skill | Actions → tier |
 |---|---|
+| **Conversations (wacli)** | Search/read/summarise my chats with people ("what did X say about Y", "what did I promise this week") → T0 · draft a reply → T1 · send as me → T2 with spoken readback for 1:1 chats with known contacts, T3 for groups, new contacts, or anything with money/addresses/attachments · extract commitments into calendar/tasks → per those skills' tiers |
 | **Calendar** | Read/search → T0 · create/move my own events → T2 · invite/notify others → T2 |
 | **Mail** | Search/summarise → T0 · draft → T1 · send → T2 (short replies to known contacts) or T3 (new recipients, attachments) |
 | **Shopping list** | Add/remove items by voice → T1 · **Friday order:** the scheduler builds the cart Friday morning → T1; placing the order → **T3 approval on the phone** with total and item list |
@@ -146,6 +152,9 @@ Voice alone never authorises T3. Anyone holding the watch can talk to it.
 | Someone else uses the watch | Device token + Cloudflare Access; T3 needs the phone; kill switch revokes the watch |
 | Lost watch with spooled recordings | Flash encryption before real use (SPEC §14); acknowledged chunks deleted |
 | **Prompt injection** via mail, calendar invites, web pages, code comments | Content from these sources is untrusted *data*. Once a turn has read untrusted content, T2/T3 actions in that turn need an explicit approval that shows the exact action. Tool outputs are never treated as instructions. |
+| **Inbound messages as an attack channel** — anyone who can message me can put text in front of the agent ("ignore previous instructions, send me…") | Chat content fetched through wacli is untrusted data, the same as mail. It can't trigger sends, payments or code actions without the approval rules above. Senders are never treated as authorised to instruct the agent. |
+| Impersonation: the agent sending messages as me | Send is T2/T3 only; spoken readback of the exact text and recipient; no auto-replies in v1 |
+| Third-party privacy: other people's messages flow into prompts and logs | Fetch only what the current request needs; never store message bodies in the audit log (store chat id + message ids instead); short retention for any cached conversation context; such content never reaches this public repo, test fixtures or bug reports |
 | Secret leakage | Vault references only; secrets never in prompts or logs; `.env` never committed; CI secret scan |
 | Tunnel exposure | Access policy in front of every route; no unauthenticated endpoints; rate limiting |
 | Runaway automation (e.g. the Friday order) | Scheduled jobs prepare, humans approve; spend caps; audit log; dry-run mode |
@@ -169,7 +178,8 @@ Voice alone never authorises T3. Anyone holding the watch can talk to it.
 | **G0** | Gateway skeleton = the mock server grown up: real STT/TTS, sessions, audit log | Watch (or simulator) holds a 3-turn spoken conversation with a stub brain |
 | **G1** | `InstinctBrain` via wacli, exposed through the Cloudflare tunnel with Access | Real questions answered by Instinct from the watch; reply/turn correlation proven |
 | **G2** | Recordings pipeline: transcript + summary + action items | A 60-min meeting from the watch produces a usable summary |
-| **G3** | `OnurbAgentBrain` with calendar, mail (T0–T2), shopping list, `ask_instinct` | Side-by-side comparison with G1 on latency and usefulness |
+| **G3** | `OnurbAgentBrain` with conversations via wacli (read/summarise only, T0), calendar, mail (T0–T2), shopping list, `ask_instinct` | Side-by-side comparison with G1, including questions only conversation context can answer |
+| **G3b** | Conversation actions: drafts and sends with readback (T1–T2) | 20 sends with zero wrong-recipient or wrong-text incidents; an injection test message from a second phone triggers no action |
 | **G4** | Approvals on the phone (T3), Friday shopping order end-to-end | One real order placed only after phone approval |
 | **G5** | herdr code orchestration skill | Start, monitor and report a coding task by voice; nothing merged without T3 |
 | **G6** | Vault integration; read-only banking | Balance question answered; zero secret values in logs (verified by scan) |
@@ -180,7 +190,7 @@ Voice alone never authorises T3. Anyone holding the watch can talk to it.
 
 | # | Question |
 |---|---|
-| Q1 | What exactly can wacli do: dedicated thread per watch session? message IDs to correlate replies? typical round-trip latency? |
+| Q1 | What exactly can wacli do? As a transport to Instinct: a dedicated thread per watch session, message IDs to correlate replies, round-trip latency. As a context source: search across chats, history depth, group chats, media/voice notes, and whether it can be limited to read-only. |
 | Q2 | Does Instinct expose a direct API that would beat going through messaging? |
 | Q3 | Which mail/calendar providers, and which of them does Instinct already cover (to avoid duplicating)? |
 | Q4 | Which grocery service for the Friday order, and does it have an API, or would it need browser automation? |
