@@ -19,7 +19,7 @@ Every technical claim in this spec carries one of these confidence tags:
 | **[DOC]** | Taken from official vendor/Espressif/Apple documentation; not verified on our hardware. |
 | **[UNVERIFIED]** | Plausible, reported, or inferred — must be confirmed before relying on it. |
 | **[DECISION]** | A design choice made by this spec. Can be changed by a spec revision. |
-| **[PHYS]** | Can only be confirmed on real hardware; listed in §15 physical acceptance tests. |
+| **[PHYS]** | Can only be confirmed on real hardware; listed in §16 physical acceptance tests. |
 
 Normative keywords **MUST / SHOULD / MAY** are used as in RFC 2119.
 
@@ -27,7 +27,12 @@ Normative keywords **MUST / SHOULD / MAY** are used as in RFC 2119.
 
 ## 1. Product overview
 
-Onurb turns the Waveshare watch into an asynchronous voice terminal:
+Onurb is the complete watch system: firmware, audio, connectivity, triggers, UI, the APIs it speaks, and the test backend. It has two user-facing modes that share one audio pipeline and never run at the same time:
+
+- **Assistant mode** (§5–§9): a short, push-to-talk exchange with an assistant that replies with speech.
+- **Recording mode** (§10): long, uninterrupted capture of meetings or voice memos. It starts and stops from a button or the screen and uploads for later transcription and summary. Nothing is played back.
+
+Assistant mode works like this:
 
 1. The user triggers a turn — by pressing the **BOOT button**, or (optional) by performing a **personally trained wrist gesture**.
 2. The watch **records** speech from its onboard microphones.
@@ -44,12 +49,14 @@ Audio is strictly **half-duplex: record, then play**. Onurb never captures and p
 - G3. Robust on-the-go connectivity through an iPhone Personal Hotspot, with automatic reconnection.
 - G4. An optional hands-free trigger based on a user-trained gesture (§7).
 - G5. Honest, measured numbers for latency, battery and thermal behaviour before any claims are made.
+- G6. Meeting/memo recording of ≥60 min that survives Wi-Fi loss and reboots without losing audio (§10).
 
 ### 1.2 Non-goals (v1)
 
 - Full-duplex / barge-in conversation, wake-word detection, on-device speech recognition or synthesis.
 - Cellular (no 4G/SIM on this board) and 5 GHz Wi-Fi (ESP32-S3 is 2.4 GHz only).
-- A rich touch UI (the display stays off in v1; see §8.4).
+- A rich touch UI. Assistant mode runs with the display off; recording mode needs only a minimal status/stop screen (§8.4, §10.4).
+- On-device transcription or summarisation of recordings (server-side only).
 - Water resistance (the kit is **not waterproof** [DOC]).
 - All-day battery life claims.
 
@@ -66,6 +73,10 @@ Audio is strictly **half-duplex: record, then play**. Onurb never captures and p
 | **Audio session** | Exclusive ownership of I2S + ES8311 + ES7210 + PA by one client. |
 | **DTW** | Dynamic Time Warping — the template-matching algorithm for gestures. |
 | **Mock server** | Local Python HTTP server implementing the Turn API with canned replies. |
+| **Recording** | One recording-mode session (meeting or memo). Identified by `recording_id`. |
+| **Chunk** | A self-contained, independently decodable 30 s piece of a recording. |
+| **Spool** | On-device flash storage for chunks not yet acknowledged by the server. |
+| **Marker** | A user-placed bookmark timestamp inside a recording ("this part matters"). |
 
 ---
 
@@ -96,6 +107,7 @@ The firmware **MUST** consume the BSP pinned by git commit (component-manager `g
 | Display | 2.06" AMOLED (SH8601 driver), capacitive touch FT5x06 | [SRC] |
 | Battery | Official FAQ recommends 400 mAh; USB-C charging | [DOC] |
 | Haptics | No vibration motor confirmed | [UNVERIFIED] — do not depend on one |
+| SD card | BSP exposes `bsp_sdcard_mount()`; the official `06_videoplayer` example plays from SD | [SRC]; slot access inside the watch case is [PHYS] |
 
 ### 3.3 Pin map (from BSP header — the only authoritative source) [SRC]
 
@@ -144,7 +156,9 @@ Firmware **MUST** reference BSP macros, never duplicate these numbers as literal
 | `onurb_wifi` | STA connect, reconnect with backoff, connectivity events (§8). | esp_wifi, esp_netif |
 | `onurb_turn` | Turn API client: streaming upload, sync/async reply, retries (§9). | esp_http_client, esp-tls, crt bundle |
 | `onurb_input` | BOOT button driver; QMI8658 sampler + gesture engine (§7). | driver/gpio, i2c (via BSP) |
-| `onurb_feedback` | Tones (v1); display status (later milestone). | onurb_audio |
+| `onurb_feedback` | Tones. | onurb_audio |
+| `onurb_recorder` | Recording mode: encoder, chunker, flash spool, background chunk uploader (§10). | onurb_audio, onurb_core, LittleFS |
+| `onurb_ui` | Minimal LVGL screens: home (Record button), recording (timer, marker count, Stop), screen-sleep policy (§10.4). | BSP display/touch, LVGL |
 | `main` | `app_main`, controller task, Kconfig, wiring. | all |
 
 ### 4.2 Tasks
@@ -156,6 +170,9 @@ Firmware **MUST** reference BSP macros, never duplicate these numbers as literal
 | turn_net | 0 | 5 | 8 KB | HTTP(S); TLS buffers in PSRAM. |
 | button | 1 | 7 | 2 KB | 10 ms poll, debounce. |
 | imu | 1 | 5 | 4 KB | 100 Hz sampling + gesture engine (only if enabled). |
+| rec_encode | 1 | 7 | 16 KB | Recording mode only: PCM → encoder → chunk files. |
+| rec_upload | 0 | 4 | 8 KB | Drains the spool whenever an IP is available, in either mode. |
+| ui | 0 | 3 | 6 KB | LVGL; only runs while the display is awake. |
 | Wi-Fi/lwIP | 0 | IDF default | — | Event handlers only post events; no blocking work. |
 
 All inter-task communication goes through the controller's event queue. No component calls another component's blocking API from an event handler.
@@ -169,6 +186,9 @@ All inter-task communication goes through the controller's event queue. No compo
 | TDM read scratch | 4 ch × 2 B × 240 frames = 1 920 B | Internal RAM, DMA-capable. |
 | Gesture templates | 5 × 200 samples × 6 axes × 2 B = 12 KB | Plus 2.5 s ring buffer (3 KB). |
 | TLS | ~40 KB | `CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y`. |
+| Recording PCM ring | 2 s × 48 000 B = 96 KB | Recording mode reuses the capture buffer region; assistant and recording modes never coexist. |
+
+Recording mode never holds a whole recording in RAM. A one-hour raw recording at 48 000 B/s is about 173 MB, more than 20× the PSRAM. It is compressed and spooled to flash in chunks (§10.3).
 
 ---
 
@@ -186,6 +206,8 @@ All inter-task communication goes through the controller's event queue. No compo
 | `AWAITING_REPLY` | Waiting for sync body or polling an async job. |
 | `PLAYING` | Playing the reply. |
 | `TEACH` | Gesture enrollment (§7.3). |
+| `REC_LONG` | Recording mode active (§10). Assistant triggers and gesture detection are suspended. |
+| `REC_FINALIZING` | Encoder flushing the last chunk, writing the manifest, queueing `complete`. |
 | `ERROR` | Plays an error tone with a code, then returns to `IDLE`. |
 
 ### 5.2 Transitions
@@ -207,7 +229,13 @@ All inter-task communication goes through the controller's event queue. No compo
 | AWAITING_REPLY | timeout / 4xx / 5xx | — | ERROR(E_API) | — |
 | PLAYING | done | — | IDLE | release PA |
 | PLAYING | BTN_DOWN | — | IDLE → RECORDING | stop playback first (no overlap) |
-| any | fatal audio error | — | ERROR(E_AUDIO) → reinit audio session | — |
+| IDLE | BTN_DOUBLE_TAP / UI_RECORD | spool has ≥ 5 min free | REC_LONG | start tone (before mic opens), create recording |
+| IDLE | BTN_DOUBLE_TAP / UI_RECORD | spool too full | ERROR(E_STORAGE) | — |
+| REC_LONG | BTN_TAP | — | REC_LONG | add marker (silent, shown on screen) |
+| REC_LONG | BTN_DOUBLE_TAP / UI_STOP / max duration / battery ≤ `ONURB_REC_MIN_BATTERY_PCT` / spool full | — | REC_FINALIZING | — |
+| REC_FINALIZING | manifest written | — | IDLE | stop tone (after mic closes); upload continues in background |
+| BOOT | spool contains an unfinished recording | — | IDLE | recover: close the last valid chunk, mark the recording `interrupted`, queue upload |
+| any | fatal audio error | — | ERROR(E_AUDIO) → reinit audio session | in REC_LONG: finalize what is already spooled first |
 
 A recording **MAY** start while offline: the turn is buffered, a reconnect is kicked immediately (§8.2), and the upload proceeds once an IP is obtained, up to `ONURB_OFFLINE_WAIT_S` (default 20 s). Only one turn is ever in flight; there is no persistent queue in v1.
 
@@ -285,6 +313,8 @@ No resampling happens on the device. Any change of rate requires a full `bsp_aud
 | Sampling | 10 ms poll, 30 ms debounce |
 | Mode | `ONURB_BUTTON_MODE`: **HOLD** (hold-to-talk, default) or **TOGGLE** (tap to start, tap to stop) |
 | Minimum turn | `ONURB_MIN_RECORD_MS` = 400 ms (shorter = discarded) |
+| Double tap | 2 taps < 250 ms each within 600 ms (and no third) → start/stop **recording mode** (§10) |
+| Single tap in recording mode | Adds a marker; never stops the recording (prevents accidental stops) |
 | Triple tap | 3 taps < 250 ms each within 1.5 s → TEACH (when gesture enabled) |
 | Strapping caveat | GPIO0 is a boot strapping pin: holding it at reset enters download mode. Documented in README; harmless in normal use. [DOC] |
 
@@ -354,7 +384,7 @@ Screen-off behaviour: v1 never initialises the display, so the button must work 
 
 ### 8.4 Display
 
-v1 leaves the AMOLED uninitialised (off). A later milestone (M6) may add a minimal LVGL status face (state, Wi-Fi, battery); it must not change the audio or input contracts.
+Assistant mode keeps the AMOLED off. Recording mode adds the minimal UI defined in §10.4. A fuller status face (Wi-Fi, battery, pending uploads) is a later milestone and must not change the audio or input contracts.
 
 ---
 
@@ -409,24 +439,94 @@ Total wait bounded by `ONURB_REPLY_TIMEOUT_S` (default 60 s).
 
 ---
 
-## 10. Mock server
+## 10. Recording mode (meetings and memos)
+
+### 10.1 Behaviour
+
+- **Start:** double-tap BOOT, or tap **Record** on the home screen. A start tone plays *before* the mic opens, so it is not in the recording.
+- **During:** the display shows a red dot, elapsed time and marker count, then sleeps after `ONURB_UI_SLEEP_S` (default 10 s). Touching the screen wakes it. A single BOOT tap adds a **marker**. Assistant triggers and gestures are suspended because the audio session is busy.
+- **Stop:** double-tap BOOT, or wake the screen and tap **Stop**. The Stop button needs a 1 s press-and-hold so a sleeve brushing the screen can't end a meeting. A stop tone plays *after* the mic closes.
+- **Automatic stop:** max duration (`ONURB_REC_MAX_MIN`, default 120), battery at `ONURB_REC_MIN_BATTERY_PCT` (default 10 %), or spool full. Each finalizes cleanly, keeping everything recorded so far.
+- **Afterwards:** chunks upload in the background, and the server transcribes and summarises (§10.5). The watch plays nothing back.
+
+### 10.2 Audio and encoding
+
+| Parameter | Value |
+|---|---|
+| Capture | Same BSP voice profile as assistant mode: 24 kHz, 16-bit, 4 TDM slots (§6.1) |
+| Channel | `ONURB_REC_MIC_SOURCE`, default `AVG12` (both front mics; better for a room than one mic) |
+| Gain | `ONURB_REC_GAIN_DB`, default 30 dB (far-field); tuned by A-REC-01 |
+| Codec | **Opus**, 24 kHz mono, VOIP application, 24 kbit/s, 20 ms frames, in Ogg, via Espressif `esp_audio_codec` [DECISION; availability and CPU cost at 24 kHz are [UNVERIFIED] until M2 builds it] |
+| Fallback codec | IMA ADPCM WAV (4:1, 12 kB/s), portable C in `onurb_core`, host-tested |
+| Chunking | 30 s per chunk, each a self-contained file (Ogg Opus or ADPCM WAV), so one lost or corrupt chunk never breaks the others |
+| Data rate | Opus ≈ 3 kB/s ≈ **11 MB/h**; ADPCM ≈ 12 kB/s ≈ 43 MB/h |
+
+### 10.3 Spool (store-and-forward)
+
+- Every chunk is written to flash **before** any upload attempt. A chunk is deleted only after the server acknowledges it (2xx).
+- Storage: a LittleFS partition `spool` of about 8 MB on the 16 MB flash, which holds about **40 min of Opus** (about 10 min of ADPCM). If an SD card is mounted, it is used instead and allows much longer recordings (§3.2).
+- Layout: `/spool/<recording_id>/manifest.json` (kind, start time, codec, chunk count, markers, state) plus `NNNNN.ogg`.
+- Writes are atomic: each chunk goes to `.tmp`, is fsynced, then renamed. The manifest is rewritten after each chunk. After a power loss, the boot-time recovery (§5.2) keeps every complete chunk.
+- When the spool is full while recording, the recording finalizes. When it's full at start, the watch refuses to start if less than 5 min is free.
+- Upload policy `ONURB_REC_UPLOAD`:
+  - `LIVE` (default): upload while recording whenever Wi-Fi is up.
+  - `DEFER`: keep Wi-Fi off during the recording to save battery, then upload afterwards.
+- Either way the uploader retries with backoff and resumes after reboot.
+
+### 10.4 Minimal UI
+
+| Screen | Content |
+|---|---|
+| Home (on wake) | Clock, Wi-Fi/battery icons, big **Record** button, "N recordings pending upload" |
+| Recording | Red dot, elapsed time, marker count, **Stop** (hold 1 s) |
+| Finalizing | "Saved — uploading in background" for 3 s, then sleep |
+
+The display is off whenever no screen is needed. Touch wake behaviour with the screen off is tested in A-REC-04.
+
+### 10.5 Recordings API v1
+
+```
+POST {ONURB_API_BASE_URL}/v1/recordings
+  JSON {"recording_id": "<uuid>", "kind": "meeting|memo", "started_at": "<ISO-8601>",
+        "codec": "opus/ogg|adpcm/wav", "sample_rate": 24000}
+  → 201 (idempotent on recording_id)
+
+PUT  /v1/recordings/{id}/chunks/{seq}            Content-Type: audio/ogg | audio/wav
+  X-Onurb-Chunk-Start-Ms: <offset from recording start>
+  → 201 / 200 if already stored (idempotent on seq)
+
+POST /v1/recordings/{id}/complete
+  JSON {"chunks": N, "duration_ms": D, "markers_ms": [...], "state": "complete|interrupted"}
+  → 202 (server transcribes/summarises asynchronously)
+```
+
+Same auth, device headers, TLS rules and retry policy as the Turn API (§9). What happens to a finished recording, e.g. a transcript, summary and action items sent to the assistant, is the backend's job and is outside this firmware spec.
+
+### 10.6 Consent
+
+Recording other people is regulated differently by jurisdiction and often requires their consent. Onurb shows a visible recording indicator whenever the screen is awake. Getting consent is the user's responsibility; the firmware does not try to enforce it.
+
+---
+
+## 11. Mock server
 
 Location `mock_server/`. Python ≥ 3.9, **standard library only**.
 
 | Feature | Spec |
 |---|---|
-| Endpoints | `POST /v1/turns`, `GET /v1/turns/{id}/reply`, `GET /healthz`, `POST /v1/imu-log` (future) |
+| Endpoints | `POST /v1/turns`, `GET /v1/turns/{id}/reply`, `POST /v1/recordings`, `PUT /v1/recordings/{id}/chunks/{seq}`, `POST /v1/recordings/{id}/complete`, `GET /healthz`, `POST /v1/imu-log` (future) |
+| Recordings | Stores chunks under `mock_server/received/recordings/<id>/`, and on `complete` concatenates them into one file and writes a JSON manifest with markers. `--drop-chunk-rate` simulates lost acknowledgements to exercise spool retries. |
 | Validation | Parses WAV; rejects non-PCM / wrong rate / wrong channels with 415 and a JSON reason |
 | Storage | Saves each upload to `mock_server/received/<timestamp>_<turn_id>.wav` (gitignored) — this is how capture quality (A-AUD-01) is reviewed |
 | Reply modes | `--reply tone` (canned 24 kHz chime + short phrase-like tone pattern), `--reply echo` (plays your own recording back — doubles as a capture check), `--reply file PATH` (must be 24 kHz s16 WAV) |
 | Async | `--mode sync` (200) or `--mode async` (202 + poll, `--delay` seconds) |
 | Fault injection | `--token` (require bearer), `--fail-rate 0.2` (random 503), `--latency-ms` |
 | Idempotency | Repeated `X-Onurb-Turn-Id` returns the same job |
-| Device simulator | `tools/simulate_device.py` — builds a WAV exactly like the firmware (shared test vectors with `onurb_core`) and runs a full turn incl. polling |
+| Device simulator | `tools/simulate_device.py` — builds a WAV exactly like the firmware (shared test vectors with `onurb_core`) and runs a full turn incl. polling; `--recording 10m` simulates a recording-mode session with chunking, markers, a mid-session disconnect and resume |
 
 ---
 
-## 11. Configuration (Kconfig `Onurb` menu)
+## 12. Configuration (Kconfig `Onurb` menu)
 
 All environment-specific values are placeholders. **No real secrets, production credentials or production endpoints are ever committed.** Local values go in `firmware/sdkconfig` / `sdkconfig.local` (gitignored) via `idf.py menuconfig`.
 
@@ -458,22 +558,31 @@ All environment-specific values are placeholders. **No real secrets, production 
 | `ONURB_GESTURE_CONFIRM_MS` | `1500` | |
 | `ONURB_VAD_HANGOVER_MS` | `900` | |
 | `ONURB_IMU_LOG_ENABLE` | `n` | future |
+| `ONURB_REC_ENABLE` | `y` | recording mode |
+| `ONURB_REC_MAX_MIN` | `120` | |
+| `ONURB_REC_MIC_SOURCE` | `AVG12` | |
+| `ONURB_REC_GAIN_DB` | `30` | |
+| `ONURB_REC_CODEC` | `OPUS` | `OPUS` / `ADPCM` |
+| `ONURB_REC_UPLOAD` | `LIVE` | `LIVE` / `DEFER` |
+| `ONURB_REC_MIN_BATTERY_PCT` | `10` | needs AXP2101 reading (M5); ignored until then |
+| `ONURB_UI_SLEEP_S` | `10` | |
 
 ---
 
-## 12. Power and thermal
+## 13. Power and thermal
 
 Source: official Waveshare FAQ [DOC], verified 2026-10-26.
 
 - Recommended cell: 400 mAh. Manufacturer reference runtimes: ~1 h full display, 3–4 h display off, ~6 h low power. **These are not Onurb measurements** and do not reflect the Wi-Fi + audio duty cycle. Onurb makes **no all-day claim**.
 - With-battery kit includes a cell (may need fitting); USB-C charging.
 - Thermal: AXP2101 internal sensor read 46 °C at 20 °C ambient (Wi-Fi STA+AP, charging, 30 min); 3–4 °C lower discharging. Internal sensor only — not skin/case temperature and not evidence of burn risk.
-- Firmware levers: display off (v1), modem sleep while idle, `WIFI_PS_NONE` only during turns, PA off outside playback, IMU off unless gesture enabled, CPU DFS (`CONFIG_PM_ENABLE`, 80–240 MHz) once stable.
+- Recording mode is the longest continuous load: mic + encoder for up to 2 h, plus Wi-Fi with `LIVE` upload. `DEFER` exists so Wi-Fi can stay off during the meeting. Nothing is promised until A-REC-03 is measured.
+- Firmware levers: display off except recording UI, modem sleep while idle, `WIFI_PS_NONE` only during turns, PA off outside playback, IMU off unless gesture enabled, CPU DFS (`CONFIG_PM_ENABLE`, 80–240 MHz) once stable.
 - Telemetry (logged per turn): battery voltage/percent and AXP2101 temperature, if AXP2101 access is added (M5).
 
 ---
 
-## 13. Security and privacy
+## 14. Security and privacy
 
 - No secrets in git; `sdkconfig`, `sdkconfig.local`, `.env`, `mock_server/received/` are gitignored. CI fails if `sdkconfig.defaults` contains non-placeholder Wi-Fi/API values (simple grep check).
 - HTTPS with the certificate bundle for any non-mock endpoint; plain HTTP gated behind an explicit Kconfig flag.
@@ -481,10 +590,11 @@ Source: official Waveshare FAQ [DOC], verified 2026-10-26.
 - Recordings live only in RAM on the device and are discarded after upload; nothing is persisted on the watch.
 - The mock server stores recordings locally for review; operators must treat them as personal data and delete them after testing.
 - Device ID is the eFuse MAC; no other identifiers are sent.
+- Recording-mode chunks **are** persisted on flash until acknowledged. That is the one exception to RAM-only audio. Spooled audio is plaintext until flash encryption is enabled, so a lost watch can expose unsent meetings. Acknowledged chunks are deleted immediately.
 
 ---
 
-## 14. Repository layout
+## 15. Repository layout
 
 ```
 onurb/
@@ -503,7 +613,9 @@ onurb/
 │       ├── onurb_wifi/
 │       ├── onurb_turn/
 │       ├── onurb_input/
-│       └── onurb_feedback/
+│       ├── onurb_feedback/
+│       ├── onurb_recorder/
+│       └── onurb_ui/
 ├── host_tests/                 CMake + plain C test runner for onurb_core
 ├── mock_server/                server.py, assets/, tests/
 ├── tools/                      simulate_device.py, wav_inspect.py
@@ -512,9 +624,9 @@ onurb/
 
 ---
 
-## 15. Verification plan
+## 16. Verification plan
 
-### 15.1 (a) Compile / mock-tested — runnable without hardware
+### 16.1 (a) Compile / mock-tested — runnable without hardware
 
 | ID | Test | How |
 |---|---|---|
@@ -523,10 +635,12 @@ onurb/
 | C-03 | Device simulator end-to-end against the mock server, using the same WAV vectors as C-01 | `tools/simulate_device.py` |
 | C-04 | **Firmware compiles** under ESP-IDF v5.5.5 for `esp32s3`, with gesture on and off | CI job in `espressif/idf:v5.5.5` container |
 | C-05 | Secret-placeholder check on `sdkconfig.defaults` | CI grep |
+| C-06 | Recording logic: ADPCM encode/decode round-trip, chunk manifest updates, spool recovery from a truncated `.tmp`, uploader retry/idempotency, double-tap vs triple-tap classification | `host_tests/` |
+| C-07 | Recordings API against the mock server, including dropped acknowledgements and resume | simulator `--recording` |
 
 Passing (a) proves logic and buildability only. It does **not** prove audio quality, pin mapping, codec init, Wi-Fi behaviour, latency, battery or gesture accuracy.
 
-### 15.2 Hardware bring-up tests (first power-on)
+### 16.2 Hardware bring-up tests (first power-on)
 
 | ID | Test | Pass criterion |
 |---|---|---|
@@ -536,7 +650,7 @@ Passing (a) proves logic and buildability only. It does **not** prove audio qual
 | B-04 | QMI8658 present on I2C (address, WHO_AM_I); INT pin routing from schematic | documented outcome |
 | B-05 | PA polarity and tone audibility at volume 70 | audible, no clipping |
 
-### 15.3 (b) Physical acceptance tests — outstanding
+### 16.3 (b) Physical acceptance tests — outstanding
 
 Pass criteria marked *(proposed)* are initial targets to be confirmed after first measurements.
 
@@ -557,25 +671,33 @@ Pass criteria marked *(proposed)* are initial targets to be confirmed after firs
 | A-GES-03 | False-trigger rate over a normal day | Wear 8 h: drinking, face touching, checking time, walking, typing | *(proposed)* ≤ 1 accepted false turn/day with speech confirmation on |
 | A-GES-04 | Left vs right wrist | Enroll and test on each | Report both |
 | A-GES-05 | IMU battery cost | Polling vs wake-on-motion (if INT available) | Report mA delta |
+| A-REC-01 | **Meeting intelligibility** | 60 min, 4 people, watch on the table and on the wrist; review the transcript | *(proposed)* every speaker intelligible within 2 m; tune gain/mic source |
+| A-REC-02 | **Wi-Fi loss during recording** | Drop the hotspot for 10 min mid-meeting | No missing chunks after reconnect |
+| A-REC-03 | **Battery for a 60 min recording** | `LIVE` vs `DEFER`, display asleep | Report % used; decide the default upload policy |
+| A-REC-04 | **Start/stop with screen off** | Double-tap BOOT and wake+hold Stop, 20× each | 20/20; no accidental stops from sleeve contact |
+| A-REC-05 | **Power loss mid-recording** | Pull the battery or force a reboot at minute 20 | All complete chunks recovered and uploaded; recording marked `interrupted` |
+| A-REC-06 | **Spool full** | Record with Wi-Fi off until full | Clean finalize and user indication; nothing corrupted |
+| A-REC-07 | **Encoder CPU/thermal** | Opus at 24 kHz for 2 h | No buffer overruns (logged), case temperature reported |
 
 ---
 
-## 16. Milestones
+## 17. Milestones
 
 | ID | Deliverable | Exit criteria |
 |---|---|---|
 | **M0** | Spec + public repo | This document merged |
 | **M1** | `onurb_core` + host tests + mock server + device simulator | C-01, C-02, C-03 green in CI |
-| **M2** | Firmware (button trigger, audio manager, Wi-Fi, Turn client), staged against pinned BSP | C-04, C-05 green in CI |
+| **M2** | Firmware (button trigger, audio manager, Wi-Fi, Turn client, recorder + spool, minimal UI), staged against pinned BSP | C-04…C-07 green in CI |
 | **M3** | Hardware bring-up | B-01…B-05 done; A-AUD-01, A-RT-01, A-BTN-01 pass |
 | **M4** | Connectivity field tests | A-NET-01…03, A-LAT-01 measured and documented |
 | **M5** | Power/thermal + AXP2101 telemetry | A-PWR-01/02, A-THM-01 measured; idle policy default chosen |
-| **M6** | Trained gesture trigger | A-GES-01…05 measured |
-| **M7** (optional) | Minimal display status face; IMU data-logging mode | — |
+| **M6** | Recording mode on hardware | A-REC-01…07 measured |
+| **M7** | Trained gesture trigger | A-GES-01…05 measured |
+| **M8** (optional) | Fuller status face; IMU data-logging mode | — |
 
 ---
 
-## 17. Risks and open questions
+## 18. Risks and open questions
 
 | # | Risk / question | Mitigation |
 |---|---|---|
@@ -587,13 +709,16 @@ Pass criteria marked *(proposed)* are initial targets to be confirmed after firs
 | R6 | PWR / GPIO10 routing ambiguity | Not used in v1; B-03 |
 | R7 | QMI8658 INT not routed → polling cost | A-GES-05; gesture default off |
 | R8 | BSP upstream changes break audio | Git-sha pin; re-audit required on bump |
+| R10 | Opus encoder unavailable or too slow at 24 kHz on ESP32-S3 | ADPCM fallback (shorter spool time); SD card extends capacity |
+| R11 | Flash wear from continuous spooling | LittleFS wear levelling; ≈11 MB/h is far below endurance for normal use; revisit if A-REC shows heavy use |
 | R9 | Reply formats from a real backend don't match 24 kHz | Contract in §9 + `Accept` header; reject clearly rather than play garbage |
 | Q1 | Final backend and auth scheme | Turn API v1 is backend-agnostic; bearer token placeholder |
+| Q3 | Should a finished recording also be sent to the assistant automatically (summary, action items)? | Backend decision; see [AGENT.md](AGENT.md) |
 | Q2 | Should replies be streamed and played progressively? | v2 candidate (chunked `audio/L16`); v1 buffers the whole reply |
 
 ---
 
-## 18. References
+## 19. References
 
 - Official board repo (pinned): https://github.com/waveshareteam/ESP32-S3-Touch-AMOLED-2.06/tree/30f3b23b3d4bb38d32f7d0cddffb66759668a855
 - Waveshare FAQ (power, thermal): https://docs.waveshare.com/ESP32-S3-Touch-AMOLED-2.06/FAQ
