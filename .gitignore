@@ -1,0 +1,25 @@
+# Internal working notes (not published)
+brief.md
+
+# ESP-IDF
+firmware/build/
+firmware/managed_components/
+firmware/dependencies.lock
+sdkconfig
+sdkconfig.old
+sdkconfig.local
+
+# Secrets / local env
+.env
+*.pem
+*.key
+
+# Mock server recordings (personal audio)
+mock_server/received/
+
+# Host builds / Python
+host_tests/build/
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
