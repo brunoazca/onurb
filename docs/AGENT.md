@@ -20,7 +20,7 @@ The watch stays a thin client. It knows only the two HTTP contracts in SPEC §9 
 ```
  Watch ──HTTPS──► Cloudflare tunnel ──► Onurb Gateway ──► Brain adapter ──► (A) Instinct via wacli
  (Turn API,        (Access service       ├ STT                             └► (B) Onurb Agent ──► skills/tools
-  Recordings API)   token auth)          ├ TTS → 24 kHz s16                                     ├ conversations (wacli)
+                                                                                                ├ conversations (wacli)
   Recordings API)   token auth)          ├ TTS → 24 kHz s16                                     ├ mail, calendar
                                          ├ sessions + inbox                                      ├ shopping list
                                          └ recordings → transcript                               ├ herdr (code)
