@@ -53,7 +53,7 @@ Audio is strictly **half-duplex: record, then play**. Onurb never captures and p
 
 ### 1.2 Non-goals (v1)
 
-- Full-duplex / barge-in conversation, wake-word detection, on-device speech recognition or synthesis.
+- Full-duplex / barge-in conversation, wake-word detection, on-device speech recognition or synthesis. (Speech recognition and synthesis happen on the server, in English and Portuguese.)
 - Cellular (no 4G/SIM on this board) and 5 GHz Wi-Fi (ESP32-S3 is 2.4 GHz only).
 - A rich touch UI. Assistant mode runs with the display off; recording mode needs only a minimal status/stop screen (§8.4, §10.4).
 - On-device transcription or summarisation of recordings (server-side only).
@@ -447,7 +447,7 @@ Total wait bounded by `ONURB_REPLY_TIMEOUT_S` (default 60 s).
 - **During:** the display shows a red dot, elapsed time and marker count, then sleeps after `ONURB_UI_SLEEP_S` (default 10 s). Touching the screen wakes it. A single BOOT tap adds a **marker**. Assistant triggers and gestures are suspended because the audio session is busy.
 - **Stop:** double-tap BOOT, or wake the screen and tap **Stop**. The Stop button needs a 1 s press-and-hold so a sleeve brushing the screen can't end a meeting. A stop tone plays *after* the mic closes.
 - **Automatic stop:** max duration (`ONURB_REC_MAX_MIN`, default 120), battery at `ONURB_REC_MIN_BATTERY_PCT` (default 10 %), or spool full. Each finalizes cleanly, keeping everything recorded so far.
-- **Afterwards:** chunks upload in the background, and the server transcribes and summarises (§10.5). The watch plays nothing back.
+- **Afterwards:** chunks upload in the background. The server **always stores and transcribes** each recording deterministically, and summarises only when asked (see AGENT.md §5). The watch plays nothing back.
 
 ### 10.2 Audio and encoding
 
@@ -497,10 +497,10 @@ PUT  /v1/recordings/{id}/chunks/{seq}            Content-Type: audio/ogg | audio
 
 POST /v1/recordings/{id}/complete
   JSON {"chunks": N, "duration_ms": D, "markers_ms": [...], "state": "complete|interrupted"}
-  → 202 (server transcribes/summarises asynchronously)
+  → 202 (server stores and transcribes asynchronously; no automatic summary)
 ```
 
-Same auth, device headers, TLS rules and retry policy as the Turn API (§9). What happens to a finished recording, e.g. a transcript, summary and action items sent to the assistant, is the backend's job and is outside this firmware spec.
+Same auth, device headers, TLS rules and retry policy as the Turn API (§9). Storage and transcription are deterministic backend duties. Summaries and action items happen only when the user asks an agent (AGENT.md §5).
 
 ### 10.6 Consent
 
@@ -713,8 +713,8 @@ Pass criteria marked *(proposed)* are initial targets to be confirmed after firs
 | R11 | Flash wear from continuous spooling | LittleFS wear levelling; ≈11 MB/h is far below endurance for normal use; revisit if A-REC shows heavy use |
 | R9 | Reply formats from a real backend don't match 24 kHz | Contract in §9 + `Accept` header; reject clearly rather than play garbage |
 | Q1 | Final backend and auth scheme | Turn API v1 is backend-agnostic; bearer token placeholder |
-| Q3 | Should a finished recording also be sent to the assistant automatically (summary, action items)? | Backend decision; see [AGENT.md](AGENT.md) |
-| Q2 | Should replies be streamed and played progressively? | v2 candidate (chunked `audio/L16`); v1 buffers the whole reply |
+| Q3 | Should a finished recording go to the assistant automatically? | **Decided 2026-10-29:** always stored and transcribed deterministically; agents act only on request ([AGENT.md](AGENT.md) §5) |
+| Q2 | Should replies be streamed and played progressively? | **Decided 2026-10-29:** no, replies play once fully generated; streaming stays a later candidate |
 
 ---
 

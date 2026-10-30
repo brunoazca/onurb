@@ -20,7 +20,7 @@ Press the BOOT button (or, optionally, perform your own trained wrist gesture). 
 | Recording mode | Double-tap BOOT or tap Record on screen to record meetings or memos; compressed chunks are spooled to flash and uploaded in the background |
 | Turn API v1 | `POST /v1/turns` (WAV, 24 kHz mono) → sync `200 audio/wav` or async `202` + poll |
 | Mock server | Python stdlib server that returns canned/echo audio so the round trip is testable without a real backend |
-| Assistant backend | Gateway (STT/TTS, sessions, inbox) in front of a swappable brain: Instinct via wacli first, then a dedicated Onurb agent with permission-tiered skills |
+| Assistant backend | Gateway (EN/PT speech in and out, sessions, inbox, recordings store) in front of a swappable brain. Path A (current): everything goes to Instinct by wacli messaging its number. Path B (alternative): a dedicated Onurb agent that owns context and integrations. |
 | Verification | Host unit tests + mock tests + CI firmware build, then a physical acceptance test plan |
 
 ## Roadmap
