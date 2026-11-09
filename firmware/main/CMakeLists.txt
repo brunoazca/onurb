@@ -1,3 +1,4 @@
-idf_component_register(SRCS "bringup_main.c" "pmu.cpp"
+idf_component_register(SRCS "bringup_main.c" "pmu.cpp" "wifi.c"
                        INCLUDE_DIRS "."
-                       REQUIRES esp_driver_gpio esp_driver_i2c esp_psram spi_flash)
+                       REQUIRES esp_driver_gpio esp_driver_i2c esp_psram spi_flash
+                                esp_wifi esp_netif esp_event esp_timer nvs_flash)

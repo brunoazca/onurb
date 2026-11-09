@@ -3,7 +3,7 @@
  * hold-to-record -> play loop).
  *
  * 0. Configures the AXP2101 charger and logs battery state (B-06), again every 30 s.
- * 1. Logs chip/flash/PSRAM info.
+ * 1. Logs chip/flash/PSRAM info, starts Wi-Fi (auto-reconnect + SNTP check).
  * 2. Scans the BSP I2C bus and names the devices we expect (B-04).
  * 3. Brings audio up with the BSP 24 kHz voice profile BEFORE creating codec
  *    devices; otherwise the BSP silently falls back to its legacy 22.05 kHz
@@ -31,6 +31,7 @@
 #include "bsp/esp-bsp.h"
 
 #include "pmu.h"
+#include "wifi.h"
 
 static const char *TAG = "onurb_bringup";
 
@@ -223,6 +224,7 @@ void app_main(void)
         ESP_LOGW(TAG, "PMU init failed - charging left at hardware defaults");
     }
     onurb_pmu_log_status();
+    onurb_wifi_start();
     i2c_scan();
     audio_init();
     button_init();
@@ -248,6 +250,7 @@ void app_main(void)
             if (++idle_ticks >= 3000) {          /* every 30 s */
                 idle_ticks = 0;
                 onurb_pmu_log_status();
+                onurb_wifi_log_status();
             }
             continue;
         }

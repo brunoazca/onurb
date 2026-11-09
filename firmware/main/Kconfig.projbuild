@@ -1,5 +1,15 @@
 menu "Onurb"
 
+    config ONURB_WIFI_SSID
+        string "Wi-Fi SSID (2.4 GHz)"
+        default "CHANGE_ME_SSID"
+        help
+            Placeholder in git. Set the real value locally (sdkconfig is gitignored).
+
+    config ONURB_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default "CHANGE_ME_PASSWORD"
+
     config ONURB_BUTTON_GPIO
         int "Push-to-talk button GPIO"
         default 0
