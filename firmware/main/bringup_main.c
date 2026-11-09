@@ -33,6 +33,7 @@
 
 #include "bsp/esp-bsp.h"
 
+#include "imu.h"
 #include "pmu.h"
 #include "turn.h"
 #include "ui.h"
@@ -175,7 +176,7 @@ static void ui_refresh(void)
     onurb_pmu_status_t st;
 
     if (onurb_pmu_get_status(&st) == ESP_OK) {
-        onurb_ui_set_battery(st.battery ? st.percent : -1, st.millivolts, st.charging, st.usb_in);
+        onurb_ui_set_battery(st.battery ? st.percent : -1, st.charging, st.usb_in);
     }
     onurb_ui_set_wifi(onurb_wifi_state_text());
 }
@@ -308,6 +309,7 @@ void app_main(void)
     onurb_wifi_start();
     ui_refresh();
     i2c_scan();
+    onurb_imu_start();
     audio_init();
     button_init();
 

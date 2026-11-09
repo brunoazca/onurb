@@ -16,12 +16,14 @@ typedef enum {
 esp_err_t onurb_ui_start(void);
 
 /* percent < 0 means no battery detected. */
-void onurb_ui_set_battery(int percent, int millivolts, bool charging, bool usb_in);
+void onurb_ui_set_battery(int percent, bool charging, bool usb_in);
 void onurb_ui_set_wifi(const char *text);
+void onurb_ui_set_motion(const char *text);
 void onurb_ui_set_state(onurb_ui_state_t state, float seconds);
 
-#define ONURB_UI_COLOR_BUSY  0xFFB300
-#define ONURB_UI_COLOR_ERROR 0xE53935
+/* Monochrome: busy is mid-gray; errors are dim and rely on the status text. */
+#define ONURB_UI_COLOR_BUSY  0x9E9E9E
+#define ONURB_UI_COLOR_ERROR 0x5A5A5A
 
 /* Free-form status line + circle color (e.g. "Thinking...", errors). */
 void onurb_ui_set_status(const char *text, uint32_t color);

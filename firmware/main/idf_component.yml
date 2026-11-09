@@ -12,3 +12,5 @@ dependencies:
     git: https://github.com/waveshareteam/ESP32-S3-Touch-AMOLED-2.06.git
     path: examples/esp-idf/01_AXP2101/components/XPowersLib
     version: 30f3b23b3d4bb38d32f7d0cddffb66759668a855
+  # QMI8658 IMU driver, as used by Waveshare's official 04_Immersive_block example.
+  waveshare/qmi8658: "2.0.0"
