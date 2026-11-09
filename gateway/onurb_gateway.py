@@ -73,20 +73,34 @@ def parse_wav(data):
 
 # --------------------------------------------------------------------------- STT
 
-def transcribe(wav_path, model, whisper_bin):
-    """Return (text, language) using whisper.cpp with language auto-detection."""
+SUPPORTED_LANGS = ("en", "pt")
+
+
+def _whisper(whisper_bin, model, wav16, lang):
+    r = subprocess.run([whisper_bin, "-m", str(model), "-f", str(wav16), "-l", lang, "-nt"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"whisper failed: {r.stderr.strip()[-300:]}")
+    text = " ".join(line.strip() for line in r.stdout.splitlines() if line.strip())
+    return text, r.stderr
+
+
+def transcribe(wav_path, model, whisper_bin, fallback_lang="pt"):
+    """Return (text, language). Auto-detects, but only English and pt-BR are
+    spoken to Onurb: short or noisy clips can be misdetected (e.g. as Russian),
+    so anything else is re-transcribed in fallback_lang."""
     with tempfile.TemporaryDirectory() as tmp:
         wav16 = Path(tmp) / "in16k.wav"
         # whisper.cpp wants 16 kHz mono s16.
         subprocess.run(["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", str(wav_path), str(wav16)],
                        check=True, capture_output=True)
-        r = subprocess.run([whisper_bin, "-m", str(model), "-f", str(wav16), "-l", "auto", "-nt"],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            raise RuntimeError(f"whisper failed: {r.stderr.strip()[-300:]}")
-    m = re.search(r"auto-detected language:\s*([a-z]{2})", r.stderr)
-    lang = m.group(1) if m else "en"
-    text = " ".join(line.strip() for line in r.stdout.splitlines() if line.strip())
+        text, err = _whisper(whisper_bin, model, wav16, "auto")
+        m = re.search(r"auto-detected language:\s*([a-z]{2})", err)
+        lang = m.group(1) if m else fallback_lang
+        if lang not in SUPPORTED_LANGS:
+            log(f"  detected [{lang}], re-transcribing as [{fallback_lang}]")
+            lang = fallback_lang
+            text, _ = _whisper(whisper_bin, model, wav16, lang)
     return text, lang
 
 
@@ -224,7 +238,7 @@ class Handler(BaseHTTPRequestHandler):
         with TURN_LOCK:
             try:
                 t0 = time.monotonic()
-                text, lang = transcribe(base.with_suffix(".in.wav"), cfg.model, cfg.whisper)
+                text, lang = transcribe(base.with_suffix(".in.wav"), cfg.model, cfg.whisper, cfg.fallback_lang)
                 t1 = time.monotonic()
                 log(f"  heard [{lang}] ({t1 - t0:.1f} s): {text!r}")
                 if cfg.brain == "instinct":
@@ -258,6 +272,8 @@ def main():
     ap.add_argument("--token", default=os.environ.get("ONURB_API_TOKEN", ""))
     ap.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     ap.add_argument("--whisper", default="whisper-cli")
+    ap.add_argument("--fallback-lang", choices=["pt", "en"], default="pt",
+                    help="language used when detection returns anything other than en/pt")
     ap.add_argument("--play-local", action="store_true", help="also play each reply on this Mac")
     cfg = ap.parse_args()
 
