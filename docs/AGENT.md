@@ -56,7 +56,7 @@ handle(session, user_text, language) → stream of events:
 | Responsibility | Notes |
 |---|---|
 | Serve the Turn API and Recordings API | Exactly as in SPEC §9, §10.5; the mock server is the reference behaviour |
-| Speech-to-text | **English and Portuguese**, language detected per turn. It must handle 24 kHz mono WAV and Opus/Ogg chunks. |
+| Speech-to-text | **English and Brazilian Portuguese (pt-BR)**, language detected per turn. It must handle 24 kHz mono WAV and Opus/Ogg chunks. |
 | Text-to-speech | One voice per language, chosen by the reply's detected language. Output **must** be resampled to 24 kHz s16 before going to the watch, which does no resampling. |
 | Speech cleanup | Mechanical only: strip markdown, emoji and URLs, and say "sent to your phone" for links and images. No rewriting of content. |
 | Reply timing | **A reply plays when it is fully generated** (no streaming playback for now). |
@@ -223,13 +223,16 @@ Only relevant if we switch ownership to Onurb. On this path Onurb owns context a
 | 2026-10-29 | Meetings and memos are always stored deterministically; agents act on them only on request. |
 | 2026-10-29 | Replies play once fully generated (no streaming playback for now). |
 | 2026-10-29 | A native to-do list is wanted (Path B skill), possibly linked to Apple. |
+| 2026-11-09 | Portuguese means **Brazilian Portuguese** (pt-BR). |
+| 2026-11-09 | wacli can send anything to Instinct (text, voice notes, files). |
+| 2026-11-09 | Meetings/recording mode are deprioritised: not part of current work. |
+| 2026-11-09 | The wishlist (to-do, shopping + Friday order, agent orchestrator, mail/calendar, reply style, safety rule) goes to Instinct as a brief: [INSTINCT_BRIEF.md](INSTINCT_BRIEF.md). Watch messages carry the `[onurb]` prefix. |
 
 ## 9. Open questions
 
 | # | Question |
 |---|---|
-| Q1 | wacli as transport: can it give message IDs or receipts, does Instinct reply in one message or several, can it send/receive voice notes and files, and what's the round-trip time? This decides how reliable reply correlation is (§4.1). |
-| Q2 | Portuguese: Brazilian or European? This picks the TTS voice and STT model. |
+| Q1 | Instinct's replies: one message or several, any end-of-reply signal, voice notes back, round-trip time? (wacli itself can send anything.) Asked in the brief. |
 | Q3 | Where does the gateway run: the same machine as Instinct, or separately? |
 | Q4 | Recordings access: R1 (Onurb stores + read API that Instinct calls) or R2 (also forward transcripts to Instinct to store)? (§5.1) |
 | Q5 | To-do Apple link: Reminders (recommended), Notes (read-only mirror), or none? Is an always-on Mac available for the sync? Only relevant on Path B. |
