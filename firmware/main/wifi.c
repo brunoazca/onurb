@@ -138,3 +138,14 @@ void onurb_wifi_log_status(void)
         ESP_LOGI(TAG, "status: connected, waiting for SNTP (internet not confirmed yet)");
     }
 }
+
+const char *onurb_wifi_state_text(void)
+{
+    if (s_retry_timer == NULL) {
+        return "Wi-Fi not configured";
+    }
+    if (!s_connected) {
+        return "Wi-Fi connecting...";
+    }
+    return time(NULL) > 1735689600 /* 2025-01-01 */ ? "Wi-Fi online" : "Wi-Fi connected";
+}

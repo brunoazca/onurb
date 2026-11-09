@@ -74,6 +74,19 @@ extern "C" esp_err_t onurb_pmu_init(void)
     return ESP_OK;
 }
 
+extern "C" esp_err_t onurb_pmu_get_status(onurb_pmu_status_t *out)
+{
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    out->battery = s_pmu.isBatteryConnect();
+    out->percent = s_pmu.getBatteryPercent();
+    out->millivolts = s_pmu.getBattVoltage();
+    out->charging = s_pmu.isCharging();
+    out->usb_in = s_pmu.isVbusIn();
+    return ESP_OK;
+}
+
 extern "C" void onurb_pmu_log_status(void)
 {
     if (!s_ready) {

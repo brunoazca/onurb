@@ -21,6 +21,11 @@ menu "Onurb"
         range 0 100
         default 60
 
+    config ONURB_SCREEN_BRIGHTNESS
+        int "Screen brightness (%)"
+        range 0 100
+        default 50
+
     config ONURB_MIC_GAIN_DB
         int "ES7210 input gain (dB)"
         range 0 37

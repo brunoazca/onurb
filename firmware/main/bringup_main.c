@@ -3,7 +3,8 @@
  * hold-to-record -> play loop).
  *
  * 0. Configures the AXP2101 charger and logs battery state (B-06), again every 30 s.
- * 1. Logs chip/flash/PSRAM info, starts Wi-Fi (auto-reconnect + SNTP check).
+ * 1. Logs chip/flash/PSRAM info, turns on the status screen, starts Wi-Fi
+ *    (auto-reconnect + SNTP check).
  * 2. Scans the BSP I2C bus and names the devices we expect (B-04).
  * 3. Brings audio up with the BSP 24 kHz voice profile BEFORE creating codec
  *    devices; otherwise the BSP silently falls back to its legacy 22.05 kHz
@@ -31,6 +32,7 @@
 #include "bsp/esp-bsp.h"
 
 #include "pmu.h"
+#include "ui.h"
 #include "wifi.h"
 
 static const char *TAG = "onurb_bringup";
@@ -164,6 +166,16 @@ static void mic_flush(int16_t *scratch, int ms)
     }
 }
 
+static void ui_refresh(void)
+{
+    onurb_pmu_status_t st;
+
+    if (onurb_pmu_get_status(&st) == ESP_OK) {
+        onurb_ui_set_battery(st.battery ? st.percent : -1, st.millivolts, st.charging, st.usb_in);
+    }
+    onurb_ui_set_wifi(onurb_wifi_state_text());
+}
+
 static void report_and_play(const int16_t *rec, int frames)
 {
     double mean[TDM_SLOTS] = {0};
@@ -204,6 +216,7 @@ static void report_and_play(const int16_t *rec, int frames)
     }
 
     ESP_LOGI(TAG, "playing back %s (loudest)", SLOT_NAMES[loudest]);
+    onurb_ui_set_state(ONURB_UI_PLAYING, 0);
     int16_t out[FRAMES_PER_READ * 2];
     for (int f = 0; f < frames; f += FRAMES_PER_READ) {
         int n = frames - f < FRAMES_PER_READ ? frames - f : FRAMES_PER_READ;
@@ -224,7 +237,11 @@ void app_main(void)
         ESP_LOGW(TAG, "PMU init failed - charging left at hardware defaults");
     }
     onurb_pmu_log_status();
+    if (onurb_ui_start() != ESP_OK) {
+        ESP_LOGW(TAG, "screen unavailable - continuing headless");
+    }
     onurb_wifi_start();
+    ui_refresh();
     i2c_scan();
     audio_init();
     button_init();
@@ -247,7 +264,10 @@ void app_main(void)
     while (true) {
         if (!button_pressed()) {
             vTaskDelay(pdMS_TO_TICKS(10));
-            if (++idle_ticks >= 3000) {          /* every 30 s */
+            if (++idle_ticks % 200 == 0) {       /* screen every 2 s */
+                ui_refresh();
+            }
+            if (idle_ticks >= 3000) {            /* logs every 30 s */
                 idle_ticks = 0;
                 onurb_pmu_log_status();
                 onurb_wifi_log_status();
@@ -264,10 +284,14 @@ void app_main(void)
         ESP_LOGI(TAG, "recording...");
 
         int frames = 0;
+        onurb_ui_set_state(ONURB_UI_RECORDING, 0);
         while (button_pressed() && frames + FRAMES_PER_READ <= max_frames) {
             esp_codec_dev_read(s_mic, rec + (size_t)frames * TDM_SLOTS,
                                FRAMES_PER_READ * TDM_SLOTS * sizeof(int16_t));
             frames += FRAMES_PER_READ;
+            if (frames % (SAMPLE_RATE / 5) == 0) {   /* screen every 200 ms */
+                onurb_ui_set_state(ONURB_UI_RECORDING, (float)frames / SAMPLE_RATE);
+            }
         }
         ESP_LOGI(TAG, "stopped (%s)", button_pressed() ? "max length" : "released");
         play_tone(660, 120);                     /* stop cue, after capture */
@@ -277,6 +301,7 @@ void app_main(void)
         } else {
             report_and_play(rec, frames);
         }
+        onurb_ui_set_state(ONURB_UI_IDLE, 0);
         while (button_pressed()) {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
