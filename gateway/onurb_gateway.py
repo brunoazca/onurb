@@ -268,7 +268,7 @@ class Handler(BaseHTTPRequestHandler):
         label = self.headers.get("X-Onurb-Label", "")
         if label not in ("correct", "wrong", "timeout", "rejected"):
             return self._error(400, f"bad label {label!r}")
-        detail = re.sub(r"[^0-9A-Za-z=;.-]", "", self.headers.get("X-Onurb-Detail", ""))[:96]
+        detail = re.sub(r"[^0-9A-Za-z=;./-]", "", self.headers.get("X-Onurb-Detail", ""))[:96]
         out = RECEIVED / "gesture_feedback" / f"{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_{label}.csv"
         out.parent.mkdir(exist_ok=True)
         out.write_bytes(body)
