@@ -10,8 +10,9 @@
  *    devices; otherwise the BSP silently falls back to its legacy 22.05 kHz
  *    mono mode with no ES7210 mics selected (SPEC §6.1, trap 1) (B-01).
  * 4. Plays a 1 kHz test tone (B-05).
- * 5. Loop: hold BOOT to record (up to CONFIG_ONURB_BRINGUP_MAX_RECORD_S),
- *    release to get per-TDM-slot levels (B-02) and hear the loudest slot.
+ * 5. Loop: hold BOOT to talk (up to CONFIG_ONURB_BRINGUP_MAX_RECORD_S); on
+ *    release, log per-TDM-slot levels (B-02), send the loudest slot as WAV to
+ *    the gateway (Turn API) and play the spoken reply.
  */
 #include <inttypes.h>
 #include <math.h>
@@ -28,11 +29,14 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_psram.h"
+#include "esp_timer.h"
 
 #include "bsp/esp-bsp.h"
 
 #include "pmu.h"
+#include "turn.h"
 #include "ui.h"
+#include "wav.h"
 #include "wifi.h"
 
 static const char *TAG = "onurb_bringup";
@@ -176,7 +180,7 @@ static void ui_refresh(void)
     onurb_ui_set_wifi(onurb_wifi_state_text());
 }
 
-static void report_and_play(const int16_t *rec, int frames)
+static int report_levels(const int16_t *rec, int frames)
 {
     double mean[TDM_SLOTS] = {0};
     double sq[TDM_SLOTS] = {0};
@@ -215,18 +219,79 @@ static void report_and_play(const int16_t *rec, int frames)
         }
     }
 
-    ESP_LOGI(TAG, "playing back %s (loudest)", SLOT_NAMES[loudest]);
+    return loudest;
+}
+
+static void on_turn_phase(onurb_turn_phase_t p)
+{
+    switch (p) {
+    case ONURB_TURN_UPLOADING:   onurb_ui_set_status("Sending...", ONURB_UI_COLOR_BUSY); break;
+    case ONURB_TURN_WAITING:     onurb_ui_set_status("Thinking...", ONURB_UI_COLOR_BUSY); break;
+    case ONURB_TURN_DOWNLOADING: onurb_ui_set_status("Receiving...", ONURB_UI_COLOR_BUSY); break;
+    }
+}
+
+/* Play a 16-bit 24 kHz mono/stereo WAV on the stereo speaker stream (SPEC §6.3). */
+static bool play_reply(const uint8_t *buf, size_t len)
+{
+    wav_info_t w;
+    int rc = wav_parse(buf, len, &w);
+
+    if (rc != 0 || w.bits != 16 || w.sample_rate != SAMPLE_RATE || (w.channels != 1 && w.channels != 2)) {
+        ESP_LOGE(TAG, "reply format unsupported (rc %d, %u Hz, %u-bit, %u ch)",
+                 rc, (unsigned)w.sample_rate, w.bits, w.channels);
+        return false;
+    }
+    const int16_t *pcm = (const int16_t *)w.data;
+    size_t frames = w.data_bytes / (2 * w.channels);
+    ESP_LOGI(TAG, "playing reply: %.1f s, %u ch", (double)frames / SAMPLE_RATE, w.channels);
     onurb_ui_set_state(ONURB_UI_PLAYING, 0);
+
     int16_t out[FRAMES_PER_READ * 2];
-    for (int f = 0; f < frames; f += FRAMES_PER_READ) {
-        int n = frames - f < FRAMES_PER_READ ? frames - f : FRAMES_PER_READ;
-        for (int i = 0; i < n; i++) {
-            int16_t v = rec[(f + i) * TDM_SLOTS + loudest];
-            out[2 * i] = v;
-            out[2 * i + 1] = v;
+    for (size_t f = 0; f < frames; f += FRAMES_PER_READ) {
+        size_t n = frames - f < FRAMES_PER_READ ? frames - f : FRAMES_PER_READ;
+        for (size_t i = 0; i < n; i++) {
+            out[2 * i] = pcm[(f + i) * w.channels];
+            out[2 * i + 1] = pcm[(f + i) * w.channels + (w.channels - 1)];
         }
         esp_codec_dev_write(s_spk, out, n * 2 * sizeof(int16_t));
     }
+    return true;
+}
+
+/* Record -> gateway -> reply -> speaker (SPEC §5 assistant turn). */
+static void run_turn(const int16_t *rec, int frames, int slot, int16_t *mono)
+{
+    uint8_t *reply = NULL;
+    size_t reply_len = 0;
+    int status = 0;
+
+    for (int f = 0; f < frames; f++) {
+        mono[f] = rec[f * TDM_SLOTS + slot];
+    }
+    ESP_LOGI(TAG, "sending %.1f s from %s to the gateway", (double)frames / SAMPLE_RATE, SLOT_NAMES[slot]);
+    int64_t t0 = esp_timer_get_time();
+    esp_err_t err = onurb_turn_send(mono, frames, SAMPLE_RATE, on_turn_phase, &reply, &reply_len, &status);
+    int64_t t1 = esp_timer_get_time();
+
+    if (err != ESP_OK) {
+        char msg[40];
+        if (status != 0) {
+            snprintf(msg, sizeof(msg), "Error: HTTP %d", status);
+        } else {
+            snprintf(msg, sizeof(msg), "Error: no connection");
+        }
+        ESP_LOGE(TAG, "turn failed: %s (HTTP %d)", esp_err_to_name(err), status);
+        onurb_ui_set_status(msg, ONURB_UI_COLOR_ERROR);
+        vTaskDelay(pdMS_TO_TICKS(3000));
+        return;
+    }
+    ESP_LOGI(TAG, "A-LAT: release -> reply received %.2f s (%u bytes)", (t1 - t0) / 1e6, (unsigned)reply_len);
+    if (!play_reply(reply, reply_len)) {
+        onurb_ui_set_status("Error: reply format", ONURB_UI_COLOR_ERROR);
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    }
+    free(reply);
 }
 
 void app_main(void)
@@ -252,12 +317,13 @@ void app_main(void)
     const int max_frames = SAMPLE_RATE * CONFIG_ONURB_BRINGUP_MAX_RECORD_S;
     int16_t *rec = heap_caps_malloc((size_t)max_frames * TDM_SLOTS * sizeof(int16_t), MALLOC_CAP_SPIRAM);
     int16_t *scratch = heap_caps_malloc(FRAMES_PER_READ * TDM_SLOTS * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-    if (rec == NULL || scratch == NULL) {
+    int16_t *mono = heap_caps_malloc((size_t)max_frames * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (rec == NULL || scratch == NULL || mono == NULL) {
         ESP_LOGE(TAG, "buffer allocation failed");
         abort();
     }
 
-    ESP_LOGI(TAG, "ready: hold BOOT to record (max %d s), release to analyse + play back",
+    ESP_LOGI(TAG, "ready: hold BOOT to talk (max %d s), release to send to the gateway",
              CONFIG_ONURB_BRINGUP_MAX_RECORD_S);
 
     int idle_ticks = 0;
@@ -299,7 +365,7 @@ void app_main(void)
         if (frames < SAMPLE_RATE / 4) {
             ESP_LOGW(TAG, "too short, ignored");
         } else {
-            report_and_play(rec, frames);
+            run_turn(rec, frames, report_levels(rec, frames), mono);
         }
         onurb_ui_set_state(ONURB_UI_IDLE, 0);
         while (button_pressed()) {

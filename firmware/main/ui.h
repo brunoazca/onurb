@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "esp_err.h"
 
@@ -18,3 +19,9 @@ esp_err_t onurb_ui_start(void);
 void onurb_ui_set_battery(int percent, int millivolts, bool charging, bool usb_in);
 void onurb_ui_set_wifi(const char *text);
 void onurb_ui_set_state(onurb_ui_state_t state, float seconds);
+
+#define ONURB_UI_COLOR_BUSY  0xFFB300
+#define ONURB_UI_COLOR_ERROR 0xE53935
+
+/* Free-form status line + circle color (e.g. "Thinking...", errors). */
+void onurb_ui_set_status(const char *text, uint32_t color);

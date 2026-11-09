@@ -130,3 +130,14 @@ void onurb_ui_set_state(onurb_ui_state_t state, float seconds)
     lv_obj_set_style_bg_color(s_dot, lv_color_hex(color), 0);
     bsp_display_unlock();
 }
+
+void onurb_ui_set_status(const char *text, uint32_t color)
+{
+    if (!s_ready) {
+        return;
+    }
+    bsp_display_lock(0);
+    lv_label_set_text(s_status, text);
+    lv_obj_set_style_bg_color(s_dot, lv_color_hex(color), 0);
+    bsp_display_unlock();
+}

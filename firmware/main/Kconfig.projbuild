@@ -10,6 +10,20 @@ menu "Onurb"
         string "Wi-Fi password"
         default "CHANGE_ME_PASSWORD"
 
+    config ONURB_API_BASE_URL
+        string "Gateway base URL"
+        default "http://192.168.1.100:8080"
+        help
+            Onurb gateway (docs/AGENT.md). Placeholder in git; set locally.
+
+    config ONURB_API_TOKEN
+        string "Gateway bearer token (empty = none)"
+        default ""
+
+    config ONURB_ALLOW_PLAIN_HTTP
+        bool "Allow plain http:// (LAN gateway / mock only)"
+        default y
+
     config ONURB_BUTTON_GPIO
         int "Push-to-talk button GPIO"
         default 0
