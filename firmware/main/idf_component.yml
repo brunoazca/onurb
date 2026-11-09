@@ -1,0 +1,14 @@
+dependencies:
+  idf: ">=5.5,<6.0"
+  # Official Waveshare BSP, pinned to the audited commit (docs/SPEC.md §3.1).
+  # Any bump requires re-running the audio audit in SPEC §6.1.
+  waveshare/esp32_s3_touch_amoled_2_06:
+    git: https://github.com/waveshareteam/ESP32-S3-Touch-AMOLED-2.06.git
+    path: examples/factory/components/waveshare__esp32_s3_touch_amoled_2_06
+    version: 30f3b23b3d4bb38d32f7d0cddffb66759668a855
+  # XPowersLib (AXP2101 driver) exactly as vendored by Waveshare's official
+  # 01_AXP2101 example at the same pinned commit.
+  xpowerslib:
+    git: https://github.com/waveshareteam/ESP32-S3-Touch-AMOLED-2.06.git
+    path: examples/esp-idf/01_AXP2101/components/XPowersLib
+    version: 30f3b23b3d4bb38d32f7d0cddffb66759668a855

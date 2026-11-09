@@ -106,7 +106,7 @@ The firmware **MUST** consume the BSP pinned by git commit (component-manager `g
 | PMIC | AXP2101 (battery, charging, internal temp sensor) | [DOC] |
 | Display | 2.06" AMOLED (SH8601 driver), capacitive touch FT5x06 | [SRC] |
 | Battery | Official FAQ recommends 400 mAh; USB-C charging | [DOC] |
-| Haptics | No vibration motor confirmed | [UNVERIFIED] — do not depend on one |
+| Haptics | Coin vibration motor on the board (silkscreen "MOT"), seen on the physical board 2026-11-09 | [PHYS] seen; drive pin not yet identified |
 | SD card | BSP exposes `bsp_sdcard_mount()`; the official `06_videoplayer` example plays from SD | [SRC]; slot access inside the watch case is [PHYS] |
 
 ### 3.3 Pin map (from BSP header — the only authoritative source) [SRC]
@@ -318,7 +318,7 @@ No resampling happens on the device. Any change of rate requires a full `bsp_aud
 | Triple tap | 3 taps < 250 ms each within 1.5 s → TEACH (when gesture enabled) |
 | Strapping caveat | GPIO0 is a boot strapping pin: holding it at reset enters download mode. Documented in README; harmless in normal use. [DOC] |
 
-**Not used:** GPIO35 (unverified claim — explicitly excluded). **PWR (claimed GPIO10)** is *not* used in v1: holding PWR > 6 s powers the device off [DOC], and its GPIO routing conflicts with the factory README (§3.3). Revisit after B-03.
+**Not used:** GPIO35 (unverified claim — explicitly excluded). **PWR** is wired to the AXP2101 power key: Waveshare's official 01_AXP2101 example reads it through PMU interrupts (`PKEY_SHORT_IRQ`/`PKEY_LONG_IRQ`), not a GPIO [SRC]. That explains the GPIO10 confusion. It is *not* used in v1: holding PWR > 6 s powers the device off [DOC], and its GPIO routing conflicts with the factory README (§3.3). Revisit after B-03.
 
 Screen-off behaviour: v1 never initialises the display, so the button must work with the screen off by construction; confirmed physically by A-BTN-01.
 
@@ -649,6 +649,7 @@ Passing (a) proves logic and buildability only. It does **not** prove audio qual
 | B-03 | PWR key routing vs schematic (GPIO10 conflict) | documented outcome |
 | B-04 | QMI8658 present on I2C (address, WHO_AM_I); INT pin routing from schematic | documented outcome |
 | B-05 | PA polarity and tone audibility at volume 70 | audible, no clipping |
+| B-06 | Battery + charger: AXP2101 configured like the official example (TS detection off, 4.2 V), charge current 200 mA default | Battery detected; charging with USB in, discharging with USB out; voltage plausible |
 
 ### 16.3 (b) Physical acceptance tests — outstanding
 

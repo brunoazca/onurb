@@ -34,3 +34,17 @@ All environment-specific values (Wi-Fi, API URL, token) are placeholders set thr
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Hardware bring-up (current step)
+
+The watch has arrived. `firmware/` holds the first bring-up app, built with ESP-IDF v5.5.5 against the pinned Waveshare BSP. It:
+- configures the battery charger
+- scans the I2C bus
+- brings up the 24 kHz audio profile and plays a test tone
+- lets you hold BOOT to record, then reports per-microphone levels and plays back the recording
+
+```sh
+. ~/esp/esp-idf/export.sh
+tools/backup_factory.sh                  # 1. back up the factory firmware first (16 MB, into backups/)
+cd firmware && idf.py -p /dev/cu.usbmodem* flash monitor   # 2. flash + watch logs
+```

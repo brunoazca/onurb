@@ -1,10 +1,12 @@
 # ESP-IDF
 firmware/build/
 firmware/managed_components/
-firmware/dependencies.lock
 sdkconfig
 sdkconfig.old
 sdkconfig.local
+
+# Factory flash backups (vendor firmware; NVS may contain Wi-Fi settings)
+backups/
 
 # Secrets / local env
 .env

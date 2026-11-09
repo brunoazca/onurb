@@ -1,0 +1,37 @@
+menu "Onurb"
+
+    config ONURB_BUTTON_GPIO
+        int "Push-to-talk button GPIO"
+        default 0
+        help
+            BOOT button = GPIO0 (active low). Do not use GPIO35 (unverified claim).
+
+    config ONURB_VOLUME
+        int "Speaker volume (0-100)"
+        range 0 100
+        default 60
+
+    config ONURB_MIC_GAIN_DB
+        int "ES7210 input gain (dB)"
+        range 0 37
+        default 24
+
+    config ONURB_BRINGUP_MAX_RECORD_S
+        int "Bring-up: max hold-to-record length (s)"
+        range 1 20
+        default 10
+
+    choice ONURB_CHARGE_CURRENT
+        prompt "Battery charge current (AXP2101 constant-current phase)"
+        default ONURB_CHARGE_CURRENT_200MA
+        help
+            The kit's cell is 400 mAh. 200 mA (0.5C) is gentler and cooler;
+            400 mA (1C) matches Waveshare's 01_AXP2101 example.
+
+        config ONURB_CHARGE_CURRENT_200MA
+            bool "200 mA"
+        config ONURB_CHARGE_CURRENT_400MA
+            bool "400 mA"
+    endchoice
+
+endmenu
