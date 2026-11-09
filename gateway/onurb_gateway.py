@@ -15,6 +15,8 @@ read-only, for Instinct's reply; the reply ends after REPLY_QUIET_S without a
 new message (docs/AGENT.md §4.1).
 """
 import argparse
+import array
+import math
 import datetime as dt
 import json
 import os
@@ -71,6 +73,30 @@ def parse_wav(data):
     raise ValueError("no data chunk")
 
 
+def wav_bytes(rate, channels, pcm):
+    return (b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt " +
+            struct.pack("<IHHIIHH", 16, 1, channels, rate, rate * channels * 2, channels * 2, 16) +
+            b"data" + struct.pack("<I", len(pcm)) + pcm)
+
+
+def normalize(src, dst, target_dbfs=-22.0, max_gain_db=24.0):
+    """Remove DC and raise quiet watch recordings toward target RMS (capped gain,
+    hard clip). Returns the gain applied in dB."""
+    rate, ch, bits, pcm = parse_wav(Path(src).read_bytes())
+    a = array.array("h")
+    a.frombytes(pcm)
+    if not a:
+        Path(dst).write_bytes(Path(src).read_bytes())
+        return 0.0
+    mean = sum(a) / len(a)
+    rms = math.sqrt(sum((x - mean) ** 2 for x in a) / len(a)) or 1.0
+    gain = min(10 ** (max_gain_db / 20), (10 ** (target_dbfs / 20)) * 32768 / rms)
+    gain = max(gain, 1.0)
+    out = array.array("h", (max(-32768, min(32767, int((x - mean) * gain))) for x in a))
+    Path(dst).write_bytes(wav_bytes(rate, ch, out.tobytes()))
+    return 20 * math.log10(gain)
+
+
 # --------------------------------------------------------------------------- STT
 
 SUPPORTED_LANGS = ("en", "pt")
@@ -91,8 +117,12 @@ def transcribe(wav_path, model, whisper_bin, fallback_lang="pt"):
     so anything else is re-transcribed in fallback_lang."""
     with tempfile.TemporaryDirectory() as tmp:
         wav16 = Path(tmp) / "in16k.wav"
+        loud = Path(tmp) / "norm.wav"
+        gain_db = normalize(wav_path, loud)
+        if gain_db >= 1.0:
+            log(f"  input gain +{gain_db:.0f} dB")
         # whisper.cpp wants 16 kHz mono s16.
-        subprocess.run(["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", str(wav_path), str(wav16)],
+        subprocess.run(["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", str(loud), str(wav16)],
                        check=True, capture_output=True)
         text, err = _whisper(whisper_bin, model, wav16, "auto")
         m = re.search(r"auto-detected language:\s*([a-z]{2})", err)
@@ -206,6 +236,23 @@ class Handler(BaseHTTPRequestHandler):
         log(f"-> {code} {reason}")
         self._send(code, json.dumps({"error": reason}).encode())
 
+    def _imu_log(self):
+        """Store a tap-to-capture IMU trace (CSV) sent over Wi-Fi (SPEC §7.5)."""
+        cfg = self.server.cfg
+        if cfg.token and self.headers.get("Authorization") != f"Bearer {cfg.token}":
+            return self._error(401, "bad token")
+        length = int(self.headers.get("Content-Length") or 0)
+        if not 0 < length <= 512 * 1024:
+            return self._error(413, f"bad length {length}")
+        body = self.rfile.read(length)
+        cap = re.sub(r"[^0-9A-Za-z_-]", "", self.headers.get("X-Onurb-Capture", "x"))[:16]
+        out = RECEIVED / "imu" / f"{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_cap{cap}.csv"
+        out.parent.mkdir(exist_ok=True)
+        out.write_bytes(body)
+        samples = body.count(b"\n")
+        log(f"imu capture #{cap}: {samples} samples -> {out.name}")
+        self._send(200, b'{"ok":true}')
+
     def do_GET(self):
         if self.path == "/healthz":
             self._send(200, b'{"ok":true}')
@@ -214,6 +261,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         cfg = self.server.cfg
+        if self.path == "/v1/imu-log":
+            return self._imu_log()
         if self.path != "/v1/turns":
             return self._error(404, "not found")
         if cfg.token and self.headers.get("Authorization") != f"Bearer {cfg.token}":
@@ -233,7 +282,8 @@ class Handler(BaseHTTPRequestHandler):
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         base = RECEIVED / f"{stamp}_{turn[:8]}"
         base.with_suffix(".in.wav").write_bytes(data)
-        log(f"turn {turn[:8]}: {len(pcm) / (2 * rate):.1f} s @ {rate} Hz from {self.client_address[0]}")
+        tilt = self.headers.get("X-Onurb-Tilt", "")
+        log(f"turn {turn[:8]}: {len(pcm) / (2 * rate):.1f} s @ {rate} Hz" + (f", tilt {tilt}" if tilt else ""))
 
         with TURN_LOCK:
             try:
