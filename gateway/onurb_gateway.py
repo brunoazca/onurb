@@ -246,11 +246,35 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(413, f"bad length {length}")
         body = self.rfile.read(length)
         cap = re.sub(r"[^0-9A-Za-z_-]", "", self.headers.get("X-Onurb-Capture", "x"))[:16]
-        out = RECEIVED / "imu" / f"{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_cap{cap}.csv"
+        label = self.headers.get("X-Onurb-Label", "gesture")
+        folder = "imu_negative" if label == "other" else "imu"   # unlabelled (old firmware) = gesture
+        out = RECEIVED / folder / f"{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_cap{cap}.csv"
         out.parent.mkdir(exist_ok=True)
         out.write_bytes(body)
         samples = body.count(b"\n")
-        log(f"imu capture #{cap}: {samples} samples -> {out.name}")
+        log(f"imu capture #{cap} [{label}]: {samples} samples -> {folder}/{out.name}")
+        self._send(200, b'{"ok":true}')
+
+    def _gesture_feedback(self):
+        """Store a trained-gesture match + the user's green/red verdict with its
+        raw IMU segment, for retraining (tools/gesture_train.py)."""
+        cfg = self.server.cfg
+        if cfg.token and self.headers.get("Authorization") != f"Bearer {cfg.token}":
+            return self._error(401, "bad token")
+        length = int(self.headers.get("Content-Length") or 0)
+        if not 0 < length <= 512 * 1024:
+            return self._error(413, f"bad length {length}")
+        body = self.rfile.read(length)
+        label = self.headers.get("X-Onurb-Label", "")
+        if label not in ("correct", "wrong", "timeout", "rejected"):
+            return self._error(400, f"bad label {label!r}")
+        detail = re.sub(r"[^0-9A-Za-z=;.-]", "", self.headers.get("X-Onurb-Detail", ""))[:96]
+        out = RECEIVED / "gesture_feedback" / f"{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_{label}.csv"
+        out.parent.mkdir(exist_ok=True)
+        out.write_bytes(body)
+        (out.with_suffix(".txt")).write_text(f"label: {label}\ndetail: {detail}\n")
+        who = "rule rejected" if label == "rejected" else f"user says {label.upper()}"
+        log(f"mouth pose entry ({detail}): {who} -> {out.name}")
         self._send(200, b'{"ok":true}')
 
     def do_GET(self):
@@ -263,6 +287,8 @@ class Handler(BaseHTTPRequestHandler):
         cfg = self.server.cfg
         if self.path == "/v1/imu-log":
             return self._imu_log()
+        if self.path == "/v1/gesture-feedback":
+            return self._gesture_feedback()
         if self.path != "/v1/turns":
             return self._error(404, "not found")
         if cfg.token and self.headers.get("Authorization") != f"Bearer {cfg.token}":
