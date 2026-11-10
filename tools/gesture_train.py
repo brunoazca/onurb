@@ -47,17 +47,26 @@ def tilt(s):
             math.degrees(math.atan2(s[1], s[2])))
 
 
-def in_pose(s):
+LYING_PITCH = (-70.0, -30.0)     # second mouth box: lying down / reclined
+LYING_ROLL = (80.0, 135.0)
+
+
+def region(s):
+    """0 none, 1 upright mouth box, 2 lying-down mouth box (mirrors imu.c)."""
     pitch, roll = tilt(s)
-    return POSE_PITCH[0] <= pitch <= POSE_PITCH[1] and abs(roll) >= POSE_ROLL_ABS_MIN
+    if POSE_PITCH[0] <= pitch <= POSE_PITCH[1] and abs(roll) >= POSE_ROLL_ABS_MIN:
+        return 1
+    if LYING_PITCH[0] <= pitch <= LYING_PITCH[1] and LYING_ROLL[0] <= abs(roll) <= LYING_ROLL[1]:
+        return 2
+    return 0
 
 
 def entry_index(rows):
-    """First entry into the mouth pose (as the firmware detects it)."""
-    prev = False
+    """First move into a mouth box (incl. upright -> lying), as the firmware detects it."""
+    prev = 0
     for i, s in enumerate(rows):
-        cur = in_pose(s)
-        if cur and not prev and i >= 5:
+        cur = region(s)
+        if cur and cur != prev and i >= 5:
             return i
         prev = cur
     return None

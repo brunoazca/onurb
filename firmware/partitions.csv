@@ -1,5 +1,8 @@
 # Name,   Type, SubType, Offset,   Size
+# Two app slots for Wi-Fi updates (main/ota.c); nvs/phy_init keep their offsets.
 nvs,      data, nvs,     0x9000,   0x6000
 phy_init, data, phy,     0xf000,   0x1000
-factory,  app,  factory, 0x10000,  4M
-spool,    data, spiffs,  ,         8M
+otadata,  data, ota,     0x10000,  0x2000
+ota_0,    app,  ota_0,   0x20000,  4M
+ota_1,    app,  ota_1,   ,         4M
+spool,    data, spiffs,  ,         7M

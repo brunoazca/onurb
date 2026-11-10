@@ -40,15 +40,16 @@ menu "Onurb"
         range 0 100
         default 50
 
+    config ONURB_SCREEN_IDLE_S
+        int "Turn the screen off after this many idle seconds"
+        range 1 600
+        default 5
+
     config ONURB_MIC_GAIN_DB
         int "ES7210 input gain (dB)"
         range 0 37
         default 24
 
-    config ONURB_BRINGUP_MAX_RECORD_S
-        int "Bring-up: max hold-to-record length (s)"
-        range 1 20
-        default 10
 
     choice ONURB_CHARGE_CURRENT
         prompt "Battery charge current (AXP2101 constant-current phase)"
@@ -62,5 +63,13 @@ menu "Onurb"
         config ONURB_CHARGE_CURRENT_400MA
             bool "400 mA"
     endchoice
+
+    config ONURB_OTA_CHECK_MIN
+        int "Minutes between Wi-Fi update checks"
+        range 1 1440
+        default 5
+        help
+            The watch also checks once right after boot. Updates come from
+            ONURB_API_BASE_URL/v1/firmware (served by the gateway).
 
 endmenu

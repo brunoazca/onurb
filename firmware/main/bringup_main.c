@@ -10,12 +10,16 @@
  *    devices; otherwise the BSP silently falls back to its legacy 22.05 kHz
  *    mono mode with no ES7210 mics selected (SPEC §6.1, trap 1) (B-01).
  * 4. Plays a 1 kHz test tone (B-05).
- * 5. Loop: hold BOOT to talk (up to CONFIG_ONURB_BRINGUP_MAX_RECORD_S); on
+ * 5. Quick BOOT tap: countdown + 2.5 s IMU capture streamed as CSV.
+ * 6. Raise-to-mouth gesture starts a turn; a medium-strong movement ends it.
+ * 7. Loop: hold BOOT to talk (90 s limit); on
  *    release, log per-TDM-slot levels (B-02), send the loudest slot as WAV to
  *    the gateway (Turn API) and play the spoken reply.
  */
 #include <inttypes.h>
 #include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -32,8 +36,14 @@
 #include "esp_timer.h"
 
 #include "bsp/esp-bsp.h"
+#include "cJSON.h"
 
+#include "haptic.h"
 #include "imu.h"
+#include "ota.h"
+#include "screen.h"
+#include "spool.h"
+#include "ui_feedback.h"
 #include "pmu.h"
 #include "turn.h"
 #include "ui.h"
@@ -178,11 +188,69 @@ static void ui_refresh(void)
     if (onurb_pmu_get_status(&st) == ESP_OK) {
         onurb_ui_set_battery(st.battery ? st.percent : -1, st.charging, st.usb_in);
     }
-    onurb_ui_set_wifi(onurb_wifi_state_text());
+    onurb_ui_set_wifi((onurb_ui_wifi_t)onurb_wifi_level());
+}
+
+/* The start beep leaks electrically into the ES7210 echo-reference slot for
+ * ~80 ms (-13 dBFS); measured over the whole clip it can outweigh quiet
+ * speech, and the near-silent reference slot was sent (whisper hears "you").
+ * So slot levels skip the first 200 ms, and the sent audio drops 100 ms. */
+#define PICK_SKIP_FRAMES (SAMPLE_RATE / 5)
+#define SEND_SKIP_FRAMES (SAMPLE_RATE / 10)
+
+/* Per-slot level stats accumulated chunk by chunk while recording (integer
+ * math; the old two-pass double loop over the 3 s head ran in software floats
+ * and stalled the recording loop ~at 3 s: frozen timer, risk of lost audio). */
+typedef struct {
+    int64_t sum[TDM_SLOTS], sq[TDM_SLOTS];
+    int peak[TDM_SLOTS];
+    int frames;
+} slot_stats_t;
+
+static void slot_stats_add(slot_stats_t *st, const int16_t *chunk, int frames)
+{
+    for (int f = 0; f < frames; f++) {
+        for (int s = 0; s < TDM_SLOTS; s++) {
+            int v = chunk[f * TDM_SLOTS + s];
+            st->sum[s] += v;
+            st->sq[s] += (int64_t)v * v;
+            int a = v < 0 ? -v : v;
+            if (a > st->peak[s]) {
+                st->peak[s] = a;
+            }
+        }
+    }
+    st->frames += frames;
+}
+
+/* Loudest slot (DC removed) from the accumulated stats; logs the levels. */
+static int slot_stats_pick(const slot_stats_t *st)
+{
+    int loudest = 0;
+    float best = -1.0f;
+    int n = st->frames > 0 ? st->frames : 1;
+    ESP_LOGI(TAG, "B-02: %.2f s captured; per-slot levels (DC removed):", (double)n / SAMPLE_RATE);
+    for (int s = 0; s < TDM_SLOTS; s++) {
+        float mean = (float)st->sum[s] / n;
+        float var = (float)st->sq[s] / n - mean * mean;
+        float rms = var > 0 ? sqrtf(var) : 0;
+        ESP_LOGI(TAG, "  %-18s rms %6.1f dBFS  peak %6.1f dBFS  dc %7.1f", SLOT_NAMES[s],
+                 rms > 0 ? 20.0f * log10f(rms / 32768.0f) : -120.0f,
+                 st->peak[s] > 0 ? 20.0f * log10f(st->peak[s] / 32768.0f) : -120.0f, mean);
+        if (rms > best) {
+            best = rms;
+            loudest = s;
+        }
+    }
+    return loudest;
 }
 
 static int report_levels(const int16_t *rec, int frames)
 {
+    if (frames > 2 * PICK_SKIP_FRAMES) {
+        rec += (size_t)PICK_SKIP_FRAMES * TDM_SLOTS;
+        frames -= PICK_SKIP_FRAMES;
+    }
     double mean[TDM_SLOTS] = {0};
     double sq[TDM_SLOTS] = {0};
     int peak[TDM_SLOTS] = {0};
@@ -223,15 +291,6 @@ static int report_levels(const int16_t *rec, int frames)
     return loudest;
 }
 
-static void on_turn_phase(onurb_turn_phase_t p)
-{
-    switch (p) {
-    case ONURB_TURN_UPLOADING:   onurb_ui_set_status("Sending...", ONURB_UI_COLOR_BUSY); break;
-    case ONURB_TURN_WAITING:     onurb_ui_set_status("Thinking...", ONURB_UI_COLOR_BUSY); break;
-    case ONURB_TURN_DOWNLOADING: onurb_ui_set_status("Receiving...", ONURB_UI_COLOR_BUSY); break;
-    }
-}
-
 /* Play a 16-bit 24 kHz mono/stereo WAV on the stereo speaker stream (SPEC §6.3). */
 static bool play_reply(const uint8_t *buf, size_t len)
 {
@@ -260,44 +319,950 @@ static bool play_reply(const uint8_t *buf, size_t len)
     return true;
 }
 
-/* Record -> gateway -> reply -> speaker (SPEC §5 assistant turn). */
-static void run_turn(const int16_t *rec, int frames, int slot, int16_t *mono)
+/* ---------------------------------------------------------------- turn pipeline
+ * Bruno (2026-11-09): record the next request while earlier ones are still
+ * processing; replies pile up in the history (newest on top) in request order.
+ *
+ * - record() stays on the main task. When it ends, the turn becomes a job with
+ *   a sequence number and its own worker task (upload + wait for the reply),
+ *   and the main loop is free again (raise-to-mouth starts the next one).
+ * - Jobs are kept in request order; a reply is presented only when it is the
+ *   oldest job, so replies that arrive out of order still show in order.
+ * - The 90 s audio buffer is shared: a new recording waits until the previous
+ *   upload has finished (s_uploading; fractions of a second for short turns).
+ * - The on-screen X cancels only a request still processing (the newest one).
+ * - No Wi-Fi: the recording goes to the offline spool as before. */
+#define MAX_JOBS 6
+
+typedef enum {
+    STOP_ON_RELEASE,    /* hold-to-talk: BOOT released */
+    STOP_ON_MOTION,     /* gesture-started: wrist moves again, or BOOT pressed */
+    STOP_ON_SILENCE,    /* spoken edit while reading the preview: silence or BOOT ends it */
+} stop_mode_t;
+
+static int16_t *s_mono;                          /* the 90 s recording buffer (defined below) */
+
+typedef struct {
+    int seq;
+    int frames;
+    char turn_id[33];                            /* set by the worker before the upload */
+    char text[512];                              /* reply text for the screen */
+    bool done, abandoned;                        /* guarded by s_job_mux */
+    bool spooled, spool_full;
+    esp_err_t err;
+    int status;
+    uint8_t *reply;
+    size_t reply_len;
+    char action[ONURB_ACTION_ID_LEN];            /* WhatsApp preview proposed by the agent ("" = none) */
+    char edit_of[ONURB_ACTION_ID_LEN];           /* set: this recording is a spoken change to that preview */
+    char *action_json;                           /* fetched by the worker: {name, messages[]} */
+    uint8_t *action_avatar;                      /* 96x96 RGB565 or NULL */
+    char *gesture_csv;                           /* IMU window of the gesture that started it (or NULL) */
+    size_t gesture_len;
+    char gesture_detail[128];
+    uint32_t thread;                             /* local id of its side stick (0 = none) */
+    onurb_turn_meta_t meta;                      /* thread in (reply_to) / out (id, state, heard) */
+} turn_job_t;
+
+static portMUX_TYPE s_job_mux = portMUX_INITIALIZER_UNLOCKED;
+static turn_job_t *s_jobs[MAX_JOBS];             /* in request order; guarded by s_job_mux */
+static int s_njobs;
+static int s_next_seq = 1;
+static volatile bool s_uploading;                /* a worker is still reading s_mono */
+
+typedef enum { UI_IDLE, UI_PROCESSING, UI_REPLY, UI_NOTICE, UI_FEEDBACK, UI_ACTION } ui_mode_t;
+static ui_mode_t s_ui_mode = UI_IDLE;
+static int64_t s_ui_until_us;                    /* UI_REPLY / UI_NOTICE end */
+static bool s_screen_held;
+static turn_job_t *s_last_job;                   /* job just started by record_and_queue (main task) */
+
+/* The WhatsApp preview waiting for Confirm / Cancel / Edit on the watch (one at
+ * a time; a newer proposal replaces it). Re-shown after other activity. */
+#define ACTION_TTL_US (10LL * 60 * 1000000)
+static struct {
+    char id[ONURB_ACTION_ID_LEN];
+    char *json;
+    uint8_t *avatar;
+    int64_t until_us;
+} s_action;
+static volatile bool s_inbox_busy;
+static int64_t s_inbox_next_us;
+
+static void free_job(turn_job_t *job)
 {
-    uint8_t *reply = NULL;
-    size_t reply_len = 0;
-    int status = 0;
+    free(job->reply);
+    free(job->gesture_csv);
+    free(job->action_json);
+    free(job->action_avatar);
+    free(job);
+}
 
-    for (int f = 0; f < frames; f++) {
-        mono[f] = rec[f * TDM_SLOTS + slot];
-    }
-    ESP_LOGI(TAG, "sending %.1f s from %s to the gateway", (double)frames / SAMPLE_RATE, SLOT_NAMES[slot]);
-    int64_t t0 = esp_timer_get_time();
-    esp_err_t err = onurb_turn_send(mono, frames, SAMPLE_RATE, on_turn_phase, &reply, &reply_len, &status);
-    int64_t t1 = esp_timer_get_time();
+/* ---- Threads (Bruno, 2026-11-10): one side stick per request -------------
+ * Newest first. A stick shows what was said, a spinner while processing, then
+ * the short reply of that request. Done ones disappear THREAD_DONE_TTL after
+ * finishing; "open" ones (the agent asked something / needs the user) stay,
+ * yellow, with a mic button that records an answer to that thread only.
+ * Main task only (start_turn, present_next, inbox presentation, pipeline_tick). */
+#define MAX_THREADS      10
+#define THREAD_DONE_TTL  (60LL * 1000000)
+typedef enum { TH_PROCESSING, TH_WORKING, TH_DONE, TH_OPEN, TH_ERROR } th_state_t;
+typedef struct {
+    uint32_t id;                                 /* local, = seq of the request that opened it */
+    th_state_t state;
+    char tid[33];                                /* gateway thread id (turn id of the opening request) */
+    char heard[ONURB_HEARD_CAP];
+    char reply[320];
+    int64_t done_at;
+} thread_t;
+static thread_t s_threads[MAX_THREADS];
+static int s_nthreads;
+static bool s_threads_dirty;
+static uint32_t s_reply_to;                      /* set while recording an answer to a thread */
 
-    if (err != ESP_OK) {
-        char msg[40];
-        if (status != 0) {
-            snprintf(msg, sizeof(msg), "Error: HTTP %d", status);
-        } else {
-            snprintf(msg, sizeof(msg), "Error: no connection");
+static thread_t *thread_find(uint32_t id)
+{
+    for (int i = 0; i < s_nthreads; i++) {
+        if (s_threads[i].id == id) {
+            return &s_threads[i];
         }
-        ESP_LOGE(TAG, "turn failed: %s (HTTP %d)", esp_err_to_name(err), status);
-        onurb_ui_set_status(msg, ONURB_UI_COLOR_ERROR);
-        vTaskDelay(pdMS_TO_TICKS(3000));
+    }
+    return NULL;
+}
+
+static thread_t *thread_find_tid(const char *tid)
+{
+    for (int i = 0; tid && tid[0] && i < s_nthreads; i++) {
+        if (strcmp(s_threads[i].tid, tid) == 0) {
+            return &s_threads[i];
+        }
+    }
+    return NULL;
+}
+
+static void thread_remove(uint32_t id)
+{
+    for (int i = 0; i < s_nthreads; i++) {
+        if (s_threads[i].id == id) {
+            memmove(&s_threads[i], &s_threads[i + 1], (size_t)(s_nthreads - i - 1) * sizeof(thread_t));
+            s_nthreads--;
+            s_threads_dirty = true;
+            return;
+        }
+    }
+}
+
+/* New stick on top; when full, the oldest finished one (else the oldest) goes. */
+static thread_t *thread_new(uint32_t id)
+{
+    if (s_nthreads == MAX_THREADS) {
+        int victim = s_nthreads - 1;
+        for (int i = s_nthreads - 1; i >= 0; i--) {
+            if (s_threads[i].state == TH_DONE || s_threads[i].state == TH_ERROR) {
+                victim = i;
+                break;
+            }
+        }
+        thread_remove(s_threads[victim].id);
+    }
+    memmove(&s_threads[1], &s_threads[0], (size_t)s_nthreads * sizeof(thread_t));
+    s_nthreads++;
+    memset(&s_threads[0], 0, sizeof(thread_t));
+    s_threads[0].id = id;
+    s_threads[0].state = TH_PROCESSING;
+    s_threads_dirty = true;
+    return &s_threads[0];
+}
+
+static void thread_finish(thread_t *t, const onurb_turn_meta_t *m, const char *reply)
+{
+    if (m->thread[0]) {
+        strlcpy(t->tid, m->thread, sizeof(t->tid));
+    }
+    if (m->heard[0]) {
+        strlcpy(t->heard, m->heard, sizeof(t->heard));
+    }
+    strlcpy(t->reply, reply ? reply : "", sizeof(t->reply));
+    t->state = strcmp(m->state, "open") == 0 ? TH_OPEN : strcmp(m->state, "working") == 0 ? TH_WORKING : TH_DONE;
+    t->done_at = esp_timer_get_time();
+    s_threads_dirty = true;
+}
+
+static void threads_tick(int64_t now)
+{
+    for (int i = s_nthreads - 1; i >= 0; i--) {
+        if ((s_threads[i].state == TH_DONE || s_threads[i].state == TH_ERROR) &&
+            now - s_threads[i].done_at > THREAD_DONE_TTL) {
+            thread_remove(s_threads[i].id);
+        }
+    }
+#if ONURB_UI_HAS_THREADS
+    if (s_threads_dirty) {
+        static const onurb_thread_state_t map[] = {
+            [TH_PROCESSING] = ONURB_THREAD_PROCESSING, [TH_WORKING] = ONURB_THREAD_WORKING,
+            [TH_DONE] = ONURB_THREAD_DONE, [TH_OPEN] = ONURB_THREAD_OPEN, [TH_ERROR] = ONURB_THREAD_ERROR,
+        };
+        onurb_thread_t v[MAX_THREADS];
+        for (int i = 0; i < s_nthreads; i++) {
+            v[i] = (onurb_thread_t){s_threads[i].id, map[s_threads[i].state], s_threads[i].heard, s_threads[i].reply};
+        }
+        onurb_ui_set_threads(v, s_nthreads);
+    }
+#endif
+    s_threads_dirty = false;
+}
+
+static void action_clear(void)
+{
+    free(s_action.json);
+    free(s_action.avatar);
+    memset(&s_action, 0, sizeof(s_action));
+}
+/* After a cancel (Bruno): the circle turns red; tapping again labels that
+ * gesture "wrong" for training. Holds the cancelled request's IMU window. */
+static char *s_fb_csv;
+static size_t s_fb_len;
+static char s_fb_detail[128];
+#define FEEDBACK_MS 4000
+
+static void fb_discard(void)
+{
+    free(s_fb_csv);
+    s_fb_csv = NULL;
+}
+
+static void upload_phase(onurb_turn_phase_t p)
+{
+    if (p == ONURB_TURN_WAITING) {
+        s_uploading = false;                     /* audio sent: s_mono is free for the next recording */
+    }
+}
+
+/* WhatsApp preview proposed with this reply: fetch it now so it shows instantly. */
+static void fetch_action(turn_job_t *job)
+{
+    char path[64];
+    size_t len;
+    int st;
+    snprintf(path, sizeof(path), "/v1/actions/%s", job->action);
+    onurb_http_get(path, 8192, (uint8_t **)&job->action_json, &len, &st, NULL, 0, NULL);
+    snprintf(path, sizeof(path), "/v1/actions/%s/avatar", job->action);
+    onurb_http_get(path, 96 * 96 * 2, &job->action_avatar, &len, &st, NULL, 0, NULL);
+    if (job->action_avatar && len != 96 * 96 * 2) {
+        free(job->action_avatar);
+        job->action_avatar = NULL;
+    }
+}
+
+static void turn_worker(void *arg)
+{
+    turn_job_t *job = arg;
+
+    if (job->edit_of[0]) {                       /* spoken change to a WhatsApp preview */
+        job->err = onurb_action_edit(job->edit_of, s_mono, job->frames, SAMPLE_RATE, upload_phase, job->turn_id,
+                                     job->text, sizeof(job->text), job->action, &job->reply, &job->reply_len,
+                                     &job->status, &job->meta);
+    } else {
+        job->err = onurb_turn_send(s_mono, job->frames, SAMPLE_RATE, upload_phase, job->turn_id,
+                                   job->text, sizeof(job->text), job->action, &job->reply, &job->reply_len,
+                                   &job->status, &job->meta);
+    }
+    if (job->err == ESP_OK && job->action[0]) {  /* fetch the preview now so it shows instantly */
+        fetch_action(job);
+    }
+    if (job->err != ESP_OK && job->status == 0 && s_uploading) {
+        /* never reached the gateway: s_mono still holds this turn -> offline spool */
+        job->spooled = onurb_spool_save(s_mono, job->frames, SAMPLE_RATE) == ESP_OK;
+        job->spool_full = !job->spooled;
+    }
+    s_uploading = false;
+    taskENTER_CRITICAL(&s_job_mux);
+    bool abandoned = job->abandoned;
+    job->done = true;
+    taskEXIT_CRITICAL(&s_job_mux);
+    if (abandoned) {                             /* cancelled: nobody will present it */
+        free_job(job);
+    }
+    vTaskDelete(NULL);
+}
+
+static int jobs_pending(void)
+{
+    taskENTER_CRITICAL(&s_job_mux);
+    int n = s_njobs;
+    taskEXIT_CRITICAL(&s_job_mux);
+    return n;
+}
+
+/* Wait (bounded) for the previous upload to release s_mono. */
+static bool wait_upload_free(void)
+{
+    if (!s_uploading) {
+        return true;
+    }
+    onurb_ui_set_status("Sending...", ONURB_UI_COLOR_BUSY);
+    for (int i = 0; s_uploading && i < 3000; i++) {   /* <= 60 s (a 90 s turn on slow Wi-Fi) */
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return !s_uploading;
+}
+
+static void notice(const char *text, uint32_t color, int ms)
+{
+    onurb_ui_set_status(text, color);
+    s_ui_mode = UI_NOTICE;
+    s_ui_until_us = esp_timer_get_time() + (int64_t)ms * 1000;
+}
+
+/* The recording in s_mono becomes a background job (or goes to the spool). */
+static void start_turn(int frames, const char *edit_of)
+{
+    if (frames > 2 * SEND_SKIP_FRAMES) {         /* drop the start-beep leakage */
+        frames -= SEND_SKIP_FRAMES;
+        memmove(s_mono, s_mono + SEND_SKIP_FRAMES, (size_t)frames * sizeof(int16_t));
+    }
+    turn_job_t *job = NULL;
+    if (onurb_wifi_level() >= 1 && jobs_pending() < MAX_JOBS) {
+        job = calloc(1, sizeof(*job));
+    }
+    if (job == NULL) {                           /* offline (or too many in flight): spool it */
+        bool saved = onurb_spool_save(s_mono, frames, SAMPLE_RATE) == ESP_OK;
+        notice(saved ? "Offline - will send later" : "Offline - queue full",
+               saved ? ONURB_UI_COLOR_BUSY : ONURB_UI_COLOR_ERROR, 2000);
         return;
     }
-    ESP_LOGI(TAG, "A-LAT: release -> reply received %.2f s (%u bytes)", (t1 - t0) / 1e6, (unsigned)reply_len);
-    if (!play_reply(reply, reply_len)) {
-        onurb_ui_set_status("Error: reply format", ONURB_UI_COLOR_ERROR);
-        vTaskDelay(pdMS_TO_TICKS(3000));
+    job->seq = s_next_seq++;
+    job->frames = frames;
+    if (edit_of) {
+        strlcpy(job->edit_of, edit_of, sizeof(job->edit_of));
     }
-    free(reply);
+    thread_t *th = s_reply_to ? thread_find(s_reply_to) : NULL;
+    if (th) {                                    /* spoken answer inside an open thread */
+        strlcpy(job->meta.reply_to, th->tid, sizeof(job->meta.reply_to));
+        th->state = TH_PROCESSING;
+        s_threads_dirty = true;
+    } else {
+        th = thread_new((uint32_t)job->seq);
+        if (edit_of) {
+            strlcpy(th->heard, "Editar mensagem", sizeof(th->heard));
+        }
+    }
+    job->thread = th->id;
+    s_reply_to = 0;
+    s_last_job = job;
+    s_uploading = true;
+    taskENTER_CRITICAL(&s_job_mux);
+    s_jobs[s_njobs++] = job;
+    taskEXIT_CRITICAL(&s_job_mux);
+    ESP_LOGI(TAG, "request #%d: %.1f s queued (%d in flight)", job->seq, (double)frames / SAMPLE_RATE, s_njobs);
+    if (xTaskCreatePinnedToCore(turn_worker, "turn", 8192, job, 5, NULL, 1) != pdPASS) {
+        ESP_LOGE(TAG, "no memory for request #%d", job->seq);
+        s_uploading = false;
+        taskENTER_CRITICAL(&s_job_mux);
+        s_njobs--;                               /* it was the last one added */
+        taskEXIT_CRITICAL(&s_job_mux);
+        free(job);
+        notice("Error: no memory", ONURB_UI_COLOR_ERROR, 3000);
+        return;
+    }
+    onurb_ui_set_state(ONURB_UI_PROCESSING, 0);
+    s_ui_mode = UI_PROCESSING;
+}
+
+/* X tapped: cancel the newest request still processing. */
+static void cancel_newest(void)
+{
+    turn_job_t *job = NULL;
+    uint32_t thread_id = 0;
+    taskENTER_CRITICAL(&s_job_mux);
+    char *csv = NULL;
+    size_t csv_len = 0;
+    if (s_njobs > 0 && !s_jobs[s_njobs - 1]->done) {
+        job = s_jobs[--s_njobs];
+        job->abandoned = true;                   /* the worker frees it */
+        thread_id = job->thread;
+        csv = job->gesture_csv;                  /* keep it for the "wrong gesture" tap */
+        csv_len = job->gesture_len;
+        job->gesture_csv = NULL;
+        if (csv) {
+            memcpy(s_fb_detail, job->gesture_detail, sizeof(s_fb_detail));
+        }
+    }
+    taskEXIT_CRITICAL(&s_job_mux);
+    if (job == NULL) {
+        return;
+    }
+    char id[33];
+    memcpy(id, job->turn_id, sizeof(id));        /* job may be freed by its worker any time now */
+    ESP_LOGI(TAG, "request #%d cancelled by the user", job->seq);
+    {
+        thread_t *th = thread_find(thread_id);
+        if (th && th->tid[0]) {                  /* an answer inside an existing thread: keep it open */
+            th->state = TH_OPEN;
+            s_threads_dirty = true;
+        } else if (th) {
+            thread_remove(th->id);
+        }
+    }
+    if (id[0]) {
+        onurb_turn_cancel(id);                   /* gateway drops it (not sent to Instinct if still in STT) */
+    }
+#if ONURB_UI_HAS_CANCELLED
+    if (csv) {                                   /* red circle: tap again = the gesture was wrong */
+        fb_discard();
+        s_fb_csv = csv;
+        s_fb_len = csv_len;
+        onurb_ui_set_state(ONURB_UI_CANCELLED, 0);
+        onurb_ui_cancel_taken();                 /* the cancelling tap doesn't count twice */
+        s_ui_mode = UI_FEEDBACK;
+        s_ui_until_us = esp_timer_get_time() + (int64_t)FEEDBACK_MS * 1000;
+        return;
+    }
+#endif
+    free(csv);
+    if (jobs_pending() > 0) {
+        onurb_ui_set_state(ONURB_UI_PROCESSING, 0);   /* the X now applies to the next one */
+    } else {
+        notice("Cancelled", ONURB_UI_COLOR_BUSY, 1000);
+    }
+}
+
+/* Present the oldest finished request (keeps request order). */
+static void present_next(void)
+{
+    turn_job_t *job = NULL;
+    taskENTER_CRITICAL(&s_job_mux);
+    if (s_njobs > 0 && s_jobs[0]->done) {
+        job = s_jobs[0];
+        memmove(&s_jobs[0], &s_jobs[1], (size_t)(--s_njobs) * sizeof(s_jobs[0]));
+    }
+    taskEXIT_CRITICAL(&s_job_mux);
+    if (job == NULL) {
+        return;
+    }
+    thread_t *th = job->thread ? thread_find(job->thread) : thread_find_tid(job->meta.thread);
+    if (th == NULL && job->thread == 0 && job->reply) {   /* inbox result of a thread that's gone */
+        th = thread_new((uint32_t)job->seq);
+        strlcpy(th->heard, "Tarefa em segundo plano", sizeof(th->heard));
+    }
+    if (th && (job->spooled || job->spool_full || job->reply == NULL) && job->err == ESP_OK) {
+        if (th->tid[0] == 0) {
+            thread_remove(th->id);               /* never reached the agent / nothing heard */
+        } else {
+            th->state = TH_OPEN;                 /* an answer that didn't go through: still open */
+            s_threads_dirty = true;
+        }
+    } else if (th && job->err != ESP_OK) {
+        if (job->spooled || job->spool_full) {
+            thread_remove(th->id);
+        } else {
+            strlcpy(th->reply, job->status ? "Erro no servidor" : "Sem conexão", sizeof(th->reply));
+            th->state = TH_ERROR;
+            th->done_at = esp_timer_get_time();
+            s_threads_dirty = true;
+        }
+    } else if (th) {
+        thread_finish(th, &job->meta, job->text);
+    }
+    if (job->spooled || job->spool_full) {
+        notice(job->spooled ? "Offline - will send later" : "Offline - queue full",
+               job->spooled ? ONURB_UI_COLOR_BUSY : ONURB_UI_COLOR_ERROR, 2000);
+    } else if (job->err != ESP_OK) {
+        char msg[40];
+        snprintf(msg, sizeof(msg), job->status ? "Error: HTTP %d" : "Error: no connection", job->status);
+        ESP_LOGE(TAG, "request #%d failed: %s (HTTP %d)", job->seq, esp_err_to_name(job->err), job->status);
+        onurb_haptic(ONURB_HAPTIC_ERROR);
+        notice(msg, ONURB_UI_COLOR_ERROR, 3000);
+    } else if (job->reply == NULL) {             /* gateway heard nothing: no notice */
+        ESP_LOGI(TAG, "request #%d: no speech - dismissed", job->seq);
+    } else {
+        ESP_LOGI(TAG, "request #%d reply: %s", job->seq, job->text);
+        onurb_haptic(ONURB_HAPTIC_REPLY);        /* light, distinct from rec start/stop */
+#if ONURB_UI_HAS_REPLY && !ONURB_UI_HAS_THREADS
+        onurb_ui_set_reply(job->text);           /* pushed on top of the history */
+#endif
+        if (!play_reply(job->reply, job->reply_len)) {
+            ESP_LOGE(TAG, "request #%d: reply format unsupported", job->seq);
+        }
+        int ms = 3000 + 60 * (int)strlen(job->text);
+        s_ui_mode = UI_REPLY;
+        s_ui_until_us = esp_timer_get_time() + (int64_t)(ms > 12000 ? 12000 : ms) * 1000;
+    }
+    if (job->action_json) {                      /* the agent proposed a WhatsApp message */
+        action_clear();                          /* a newer proposal replaces an unanswered one */
+        strlcpy(s_action.id, job->action, sizeof(s_action.id));
+        s_action.json = job->action_json;
+        s_action.avatar = job->action_avatar;
+        s_action.until_us = esp_timer_get_time() + ACTION_TTL_US;
+        job->action_json = NULL;
+        job->action_avatar = NULL;
+        ESP_LOGI(TAG, "request #%d: WhatsApp preview %s", job->seq, s_action.id);
+        s_ui_mode = UI_IDLE;                     /* pipeline_tick shows the preview right away */
+    }
+    free_job(job);
+}
+
+/* WhatsApp preview on screen (UI_ACTION). */
+static void action_show(void)
+{
+#if ONURB_UI_HAS_WHATSAPP
+    cJSON *j = cJSON_Parse(s_action.json);
+    const char *name = cJSON_GetStringValue(cJSON_GetObjectItem(j, "name"));
+    cJSON *arr = cJSON_GetObjectItem(j, "messages");
+    const char *msgs[8];
+    int n = 0;
+    for (cJSON *m = arr ? arr->child : NULL; m && n < 8; m = m->next) {
+        if (cJSON_IsString(m)) {
+            msgs[n++] = m->valuestring;
+        }
+    }
+    onurb_ui_show_whatsapp(name ? name : "?", (const uint16_t *)s_action.avatar, msgs, n);
+    cJSON_Delete(j);
+    s_ui_mode = UI_ACTION;
+#endif
+}
+
+static void record_and_queue(stop_mode_t mode, const char *edit_of);
+
+/* Confirm / Cancel / Edit on the preview. */
+static void action_tick(int64_t now)
+{
+#if ONURB_UI_HAS_WHATSAPP
+    int taken = onurb_ui_action_taken();
+    if (taken != 0 || now >= s_action.until_us) {
+        onurb_ui_set_state(ONURB_UI_IDLE, 0);   /* closes the preview modal (set_status doesn't) */
+    }
+    if (taken == 1) {
+        onurb_ui_set_status("Sending...", ONURB_UI_COLOR_BUSY);
+        bool ok = onurb_action_post(s_action.id, "confirm") == ESP_OK;
+        ESP_LOGI(TAG, "WhatsApp %s: %s", s_action.id, ok ? "sent (confirmed on the watch)" : "send FAILED");
+        action_clear();
+        onurb_haptic(ok ? ONURB_HAPTIC_DOUBLE : ONURB_HAPTIC_ERROR);
+        notice(ok ? "Sent" : "Send failed", ok ? ONURB_UI_COLOR_BUSY : ONURB_UI_COLOR_ERROR, 1500);
+    } else if (taken == 2 || now >= s_action.until_us) {
+        onurb_action_post(s_action.id, "cancel");
+        ESP_LOGI(TAG, "WhatsApp %s: cancelled (%s)", s_action.id, taken == 2 ? "user" : "timeout");
+        action_clear();
+        notice("Not sent", ONURB_UI_COLOR_BUSY, 1500);
+    } else if (taken == 3) {
+        char id[ONURB_ACTION_ID_LEN];
+        strlcpy(id, s_action.id, sizeof(id));
+        ESP_LOGI(TAG, "WhatsApp %s: edit by voice", id);
+        action_clear();                          /* the agent sends a revised preview */
+        onurb_ota_set_busy(true);
+        record_and_queue(STOP_ON_SILENCE, id);
+    }
+#else
+    (void)now;
+#endif
+}
+
+/* Background-task results (gateway /v1/inbox) -> presented like a reply. */
+static void inbox_worker(void *arg)
+{
+    turn_job_t *job = calloc(1, sizeof(*job));
+    int status = 0;
+    if (job && onurb_http_get("/v1/inbox", 2 * 1024 * 1024, &job->reply, &job->reply_len, &status,
+                              job->text, sizeof(job->text), &job->meta) == ESP_OK && job->reply) {
+        if (job->meta.action[0]) {               /* the agent proposed a WhatsApp message later */
+            strlcpy(job->action, job->meta.action, sizeof(job->action));
+            fetch_action(job);
+        }
+        job->done = true;
+        taskENTER_CRITICAL(&s_job_mux);
+        bool room = s_njobs < MAX_JOBS;
+        if (room) {
+            job->seq = s_next_seq++;
+            s_jobs[s_njobs++] = job;
+        }
+        taskEXIT_CRITICAL(&s_job_mux);
+        if (room) {
+            ESP_LOGI(TAG, "inbox: background result #%d", job->seq);
+            job = NULL;
+        }
+    }
+    if (job) {
+        free_job(job);
+    }
+    s_inbox_busy = false;
+    vTaskDelete(NULL);
+}
+
+/* Idle-loop housekeeping for the pipeline: presents replies in order, the X,
+ * reply/notice timeouts, screen and OTA "busy". */
+static void pipeline_tick(void)
+{
+    int64_t now = esp_timer_get_time();
+
+    if (s_ui_mode != UI_REPLY) {
+        present_next();
+    }
+    if (s_ui_mode == UI_PROCESSING) {
+#if ONURB_UI_HAS_CANCEL
+        if (onurb_ui_cancel_taken()) {
+            cancel_newest();
+        }
+#endif
+    } else if (s_ui_mode == UI_ACTION) {
+        action_tick(now);
+    } else if (s_ui_mode == UI_FEEDBACK) {
+#if ONURB_UI_HAS_CANCEL
+        if (onurb_ui_cancel_taken() && s_fb_csv) {
+            ESP_LOGI(TAG, "user: that gesture was wrong (%s)", s_fb_detail);
+            onurb_turn_post_gesture_feedback(s_fb_csv, s_fb_len, "wrong", s_fb_detail);
+            fb_discard();
+            notice("Marked as wrong gesture", ONURB_UI_COLOR_BUSY, 1500);
+        } else
+#endif
+        if (now >= s_ui_until_us) {
+            fb_discard();
+            onurb_ui_set_state(ONURB_UI_IDLE, 0);
+            s_ui_mode = UI_IDLE;                 /* back to PROCESSING below if others are pending */
+        }
+    }
+    if ((s_ui_mode == UI_REPLY || s_ui_mode == UI_NOTICE) &&
+        (now >= s_ui_until_us || (s_ui_mode == UI_REPLY && onurb_imu_end_motion() == ONURB_IMU_END_FLICK))) {
+#if ONURB_UI_HAS_REPLY
+        onurb_ui_set_reply(NULL);                /* hides the history view; history is kept */
+#endif
+        s_ui_mode = UI_IDLE;
+    }
+    threads_tick(now);
+#if ONURB_UI_HAS_THREADS
+    uint32_t answer = onurb_ui_thread_reply_taken();
+    if (answer && (s_ui_mode == UI_IDLE || s_ui_mode == UI_PROCESSING || s_ui_mode == UI_REPLY) &&
+        thread_find(answer) && thread_find(answer)->tid[0]) {
+        ESP_LOGI(TAG, "answer by voice in thread %lu", (unsigned long)answer);
+        s_reply_to = answer;
+        onurb_ota_set_busy(true);
+        record_and_queue(STOP_ON_SILENCE, NULL);
+        s_reply_to = 0;                          /* dropped recording: thread stays as it was */
+        return;
+    }
+#endif
+    int pending = jobs_pending();
+#if ONURB_UI_HAS_PENDING && !ONURB_UI_HAS_THREADS
+    static int shown_pending = -1, shown_queued = -1;
+    int queued = onurb_spool_count();            /* recorded offline, waiting for Wi-Fi */
+    if (pending != shown_pending || queued != shown_queued) {   /* one side dash per request */
+        shown_pending = pending;
+        shown_queued = queued;
+        onurb_ui_set_pending(pending, queued);
+    }
+#endif
+    if (s_ui_mode == UI_IDLE && s_action.json && !s_uploading) {
+        action_show();                           /* pending WhatsApp preview takes the screen */
+    }
+    if (s_ui_mode == UI_IDLE && pending == 0 && !s_uploading && !s_inbox_busy && now >= s_inbox_next_us &&
+        onurb_wifi_level() >= 1) {
+        s_inbox_next_us = now + 20LL * 1000000;  /* background results: poll every 20 s when idle */
+        s_inbox_busy = true;
+        if (xTaskCreatePinnedToCore(inbox_worker, "inbox", 8192, NULL, 3, NULL, 1) != pdPASS) {
+            s_inbox_busy = false;
+        }
+    }
+    if (s_ui_mode == UI_IDLE && pending > 0) {
+        onurb_ui_set_state(ONURB_UI_PROCESSING, 0);
+        s_ui_mode = UI_PROCESSING;
+    } else if (s_ui_mode == UI_PROCESSING && pending == 0) {
+        onurb_ui_set_state(ONURB_UI_IDLE, 0);
+        s_ui_mode = UI_IDLE;
+    } else if (s_ui_mode == UI_IDLE && pending == 0 && s_screen_held) {
+        onurb_ui_set_state(ONURB_UI_IDLE, 0);
+    }
+    bool busy = pending > 0 || s_ui_mode != UI_IDLE;   /* incl. a WhatsApp preview waiting */
+    if (busy != s_screen_held) {
+        s_screen_held = busy;
+        if (busy) {
+            onurb_screen_hold();
+        } else {
+            onurb_screen_release();
+        }
+    }
+    onurb_ota_set_busy(busy || s_uploading);
+}
+
+/* Gesture-started recordings with practically no audio for the first 4 s
+ * are dropped at once (a false trigger, or the user changed their mind);
+ * once the user has spoken, 4 s of silence ends (and sends) the turn.
+ * Measured on 60 recordings (2026-11-09): every real request had >= 0.82 s
+ * of 10 ms chunks above -45 dBFS; ambient noise/music that whisper turned
+ * into invented text ("Música Música", "I'm going to go.") had <= 0.1 s.
+ * Hold-to-talk recordings below MIN_VOICED_CHUNKS are dropped too. */
+#define NO_VOICE_FRAMES   (SAMPLE_RATE * 4)
+#define MIN_VOICED_CHUNKS 40                     /* 0.4 s of voice (real requests: >= 0.82 s) */
+#define VOICE_RMS         184                    /* -45 dBFS: ambient noise/music stayed below it */
+#define END_SILENCE_FRAMES (SAMPLE_RATE * 4)     /* after speech, 4 s quiet ends the turn */
+
+/* Any slot above speech level in this 10 ms chunk? (The echo-reference slot
+ * is silent while recording; the start beep is skipped by the caller.) */
+static bool chunk_has_voice(const int16_t *chunk)
+{
+    for (int s = 0; s < TDM_SLOTS; s++) {
+        int64_t mean = 0, sq = 0;
+        for (int f = 0; f < FRAMES_PER_READ; f++) {
+            mean += chunk[f * TDM_SLOTS + s];
+        }
+        mean /= FRAMES_PER_READ;
+        for (int f = 0; f < FRAMES_PER_READ; f++) {
+            int d = chunk[f * TDM_SLOTS + s] - (int)mean;
+            sq += (int64_t)d * d;
+        }
+        if (sq > (int64_t)VOICE_RMS * VOICE_RMS * FRAMES_PER_READ) {
+            return true;
+        }
+    }
+    return false;
+}
+
+
+#define MOTION_GRACE_FRAMES (SAMPLE_RATE * 12 / 10)  /* arm settles; first words */
+
+/* Recording limit (Bruno, 2026-11-09: "um limite geral de um minuto e meio").
+ * All 4 TDM slots are kept only for the first 3 s, to pick the mic slot;
+ * after that only that slot goes into s_mono, a fixed 90 s buffer reserved at
+ * boot (4.32 MB at 24 kHz), so every recording can really reach 90 s. At 90 s
+ * the recording stops and is sent normally. */
+#define MAX_RECORD_S      90
+#define MAX_RECORD_FRAMES (SAMPLE_RATE * MAX_RECORD_S)
+#define HEAD_FRAMES       (SAMPLE_RATE * 3)
+
+static int16_t *s_mono;                          /* MAX_RECORD_FRAMES (or less if PSRAM is short) */
+static int s_mono_frames;
+static int16_t *s_head;                          /* HEAD_FRAMES x TDM_SLOTS */
+static int16_t *s_scratch;                       /* one 10 ms TDM read, DMA-capable */
+
+static void head_to_mono(int16_t *mono, int frames, int slot)
+{
+    for (int f = 0; f < frames; f++) {
+        mono[f] = s_head[f * TDM_SLOTS + slot];
+    }
+}
+
+static int s_last_voiced;                        /* voiced 10 ms chunks in the last recording */
+
+/* Start cue, record until the stop condition (or PSRAM full), stop cue.
+ * Returns the frame count with *out = the chosen mic slot as a malloc'd mono
+ * buffer the caller owns, or -1 (gesture: no voice, dropped; *out = NULL). */
+/* Recording timer on screen, off the audio loop: onurb_ui_set_state takes the
+ * display lock and can wait for an LVGL render; the mic must keep being read. */
+static volatile int s_rec_frames = -1;
+static SemaphoreHandle_t s_rec_ui_mux;           /* no RECORDING redraw after the recording ended */
+
+static void rec_ui_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        xSemaphoreTake(s_rec_ui_mux, portMAX_DELAY);
+        int f = s_rec_frames;
+        if (f >= 0) {
+            onurb_ui_set_state(ONURB_UI_RECORDING, (float)f / SAMPLE_RATE);
+        }
+        xSemaphoreGive(s_rec_ui_mux);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+static void rec_ui_stop(void)
+{
+    xSemaphoreTake(s_rec_ui_mux, portMAX_DELAY);
+    s_rec_frames = -1;
+    xSemaphoreGive(s_rec_ui_mux);
+}
+
+static int record(stop_mode_t mode, int16_t **out)
+{
+    const char *why = "90 s limit";
+    int frames = 0, slot = -1;
+
+    *out = NULL;
+    int max_frames = s_mono_frames;
+    int16_t *mono = s_mono;
+
+    onurb_haptic(ONURB_HAPTIC_REC_START);        /* felt cue: the speaker may be off */
+    play_tone(880, 60);                          /* start cue, before the mic is read */
+    mic_flush(s_scratch, 40);                    /* short: don't cut the first word */
+    ESP_LOGI(TAG, "recording (%s), limit %.0f s...",
+             mode == STOP_ON_RELEASE ? "hold" : mode == STOP_ON_MOTION ? "gesture" : "edit",
+             (double)max_frames / SAMPLE_RATE);
+    onurb_ui_set_state(ONURB_UI_RECORDING, 0);
+    int voiced = 0;                              /* 10 ms chunks with speech-level audio */
+    s_last_voiced = 0;
+    static slot_stats_t st;
+    memset(&st, 0, sizeof(st));
+    s_rec_frames = 0;                            /* rec_ui_task shows the timer from this */
+    int last_voice = 0;                          /* frame count at the last voiced chunk */
+    while (frames + FRAMES_PER_READ <= max_frames) {
+        if (mode != STOP_ON_RELEASE && frames >= NO_VOICE_FRAMES && voiced < MIN_VOICED_CHUNKS) {
+            ESP_LOGI(TAG, "no voice in %d s - dismissed", NO_VOICE_FRAMES / SAMPLE_RATE);
+            rec_ui_stop();
+            return -1;                           /* silent: no stop cue, nothing sent */
+        }
+        if (mode != STOP_ON_RELEASE && voiced >= MIN_VOICED_CHUNKS &&
+            frames - last_voice >= END_SILENCE_FRAMES) {
+            why = "4 s of silence";
+            frames = last_voice + SAMPLE_RATE / 2;   /* keep 0.5 s after the last word */
+            break;
+        }
+        if (mode == STOP_ON_RELEASE && !button_pressed()) {
+            why = "released";
+            break;
+        }
+        if (mode != STOP_ON_RELEASE && frames >= MOTION_GRACE_FRAMES) {
+            int end = mode == STOP_ON_MOTION ? onurb_imu_end_motion() : ONURB_IMU_END_NONE;
+            if (end != ONURB_IMU_END_NONE) {
+                why = end == ONURB_IMU_END_LEFT_MOUTH ? "arm lowered" : "flick";
+                break;
+            }
+            if (button_pressed()) {
+                why = "BOOT";
+                break;
+            }
+        }
+        int16_t *chunk = frames < HEAD_FRAMES ? s_head + (size_t)frames * TDM_SLOTS : s_scratch;
+        esp_codec_dev_read(s_mic, chunk, FRAMES_PER_READ * TDM_SLOTS * sizeof(int16_t));
+        if (frames >= PICK_SKIP_FRAMES && chunk_has_voice(chunk)) {
+            voiced++;
+            last_voice = frames + FRAMES_PER_READ;
+        }
+        if (frames >= PICK_SKIP_FRAMES && frames < HEAD_FRAMES) {
+            slot_stats_add(&st, chunk, FRAMES_PER_READ);
+        }
+        if (chunk == s_scratch) {
+            for (int f = 0; f < FRAMES_PER_READ; f++) {
+                mono[frames + f] = chunk[f * TDM_SLOTS + slot];
+            }
+        }
+        frames += FRAMES_PER_READ;
+        s_rec_frames = frames;
+        if (frames == HEAD_FRAMES) {             /* enough audio to pick the mic slot */
+            slot = slot_stats_pick(&st);
+            head_to_mono(mono, HEAD_FRAMES, slot);
+        }
+    }
+    rec_ui_stop();
+    if (slot < 0) {                              /* shorter than the head */
+        slot = st.frames > 0 ? slot_stats_pick(&st) : report_levels(s_head, frames > 0 ? frames : 1);
+        head_to_mono(mono, frames, slot);
+    }
+    s_last_voiced = voiced;
+    ESP_LOGI(TAG, "stopped (%s) after %.1f s, %.2f s voiced, %s", why, (double)frames / SAMPLE_RATE,
+             voiced / 100.0, SLOT_NAMES[slot]);
+    play_tone(660, 120);                         /* stop cue, after capture */
+    onurb_haptic(ONURB_HAPTIC_REC_STOP);         /* distinct from start: two ticks */
+    *out = mono;
+    return frames;
+}
+
+/* Mouth-pose entry. The trained raise-to-mouth gesture starts a turn for
+ * Instinct; a medium-strong movement ends it. Every entry's IMU window is
+ * still uploaded (accepted / rejected) so misses can be found and retrained. */
+/* Record (after the previous upload freed the buffer) and hand the turn to
+ * the pipeline; the main loop is free again right after. */
+static void record_and_queue(stop_mode_t mode, const char *edit_of)
+{
+    fb_discard();                                /* a new request ends the feedback window */
+    s_last_job = NULL;
+    if (!wait_upload_free()) {
+        notice("Busy - try again", ONURB_UI_COLOR_ERROR, 2000);
+        return;
+    }
+    int16_t *mono;
+    int frames = record(mode, &mono);            /* -1 = gesture with no voice, dropped */
+    int min_frames = mode != STOP_ON_RELEASE ? SAMPLE_RATE / 2 + MOTION_GRACE_FRAMES / 2 : SAMPLE_RATE / 4;
+    if (frames >= min_frames && s_last_voiced < MIN_VOICED_CHUNKS) {
+        ESP_LOGI(TAG, "only %.2f s of voice - dropped silently", s_last_voiced / 100.0);
+        frames = -1;
+    }
+    if (frames >= min_frames) {
+        start_turn(frames, edit_of);
+    } else {
+        onurb_ui_set_state(ONURB_UI_IDLE, 0);   /* pipeline_tick shows PROCESSING if others are pending */
+        s_ui_mode = UI_IDLE;
+    }
+}
+
+static void gesture_turn(void)
+{
+    bool accepted;
+    const char *detail, *csv;
+    size_t len;
+
+    if (!onurb_imu_gesture_take(&accepted, &detail)) {
+        return;
+    }
+    if (accepted) {                              /* also while earlier requests process / a reply shows */
+        onurb_ota_set_busy(true);                /* a background update pauses for the turn */
+        onurb_screen_hold();
+        record_and_queue(STOP_ON_MOTION, NULL);
+        onurb_screen_release();
+        while (button_pressed()) {               /* BOOT used to stop: don't start a hold turn */
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+    for (int i = 0; i < 100 && !onurb_imu_gesture_csv(&csv, &len); i++) {
+        vTaskDelay(pdMS_TO_TICKS(20));           /* post-entry second still sampling */
+    }
+    if (onurb_imu_gesture_csv(&csv, &len)) {
+        onurb_turn_post_gesture_feedback(csv, len, accepted ? "accepted" : "rejected", detail);
+        turn_job_t *job = accepted ? s_last_job : NULL;
+        char *copy = job ? malloc(len) : NULL;
+        if (copy) {                              /* kept with the request: cancel -> "wrong gesture" tap */
+            memcpy(copy, csv, len);
+            taskENTER_CRITICAL(&s_job_mux);
+            bool live = false;
+            for (int i = 0; i < s_njobs; i++) {
+                live |= s_jobs[i] == job;
+            }
+            if (live && job->gesture_csv == NULL) {
+                job->gesture_csv = copy;
+                job->gesture_len = len;
+                strlcpy(job->gesture_detail, detail, sizeof(job->gesture_detail));
+                copy = NULL;
+            }
+            taskEXIT_CRITICAL(&s_job_mux);
+            free(copy);
+        }
+    }
+    s_last_job = NULL;
+    onurb_imu_gesture_done();
+}
+
+/* Quick BOOT tap: countdown, then 2.5 s of IMU samples, labelled on the
+ * green/red screen (gesture / other movement) and sent to the gateway. */
+static void motion_capture(void)
+{
+    char buf[32];
+
+    for (int c = 3; c > 0; c--) {
+        snprintf(buf, sizeof(buf), "Get ready... %d", c);
+        onurb_ui_set_status(buf, ONURB_UI_COLOR_BUSY);
+        vTaskDelay(pdMS_TO_TICKS(700));
+    }
+    onurb_ui_set_status("Move now!", ONURB_UI_COLOR_BUSY);
+    int id = onurb_imu_capture_start(2500);
+    ESP_LOGI(TAG, "motion capture #%d started", id);
+    while (onurb_imu_capture_busy()) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    /* Label it: green = the gesture, red = some other movement (negative example). */
+    int answer = onurb_ui_feedback_ask(15000);
+    if (answer < 0) {
+        onurb_ui_set_status("Not labelled - discarded", ONURB_UI_COLOR_BUSY);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        return;
+    }
+    size_t len;
+    const char *csv = onurb_imu_capture_csv(&len);
+    bool sent = onurb_turn_post_imu(csv, len, id, answer == 1 ? "gesture" : "other") == ESP_OK;
+    snprintf(buf, sizeof(buf), sent ? "Captured #%d" : "Saved #%d (no Wi-Fi)", id);
+    onurb_ui_set_status(buf, ONURB_UI_COLOR_BUSY);
+    vTaskDelay(pdMS_TO_TICKS(1000));
 }
 
 void app_main(void)
 {
     log_system_info();
+    onurb_ota_boot_info();
     ESP_ERROR_CHECK(bsp_i2c_init());
     if (onurb_pmu_init() != ESP_OK) {
         ESP_LOGW(TAG, "PMU init failed - charging left at hardware defaults");
@@ -310,28 +1275,48 @@ void app_main(void)
     ui_refresh();
     i2c_scan();
     onurb_imu_start();
+    onurb_spool_start();
     audio_init();
     button_init();
+    onurb_haptic_init();
 
     ESP_LOGI(TAG, "B-05: 1 kHz test tone");
     play_tone(1000, 800);
 
-    const int max_frames = SAMPLE_RATE * CONFIG_ONURB_BRINGUP_MAX_RECORD_S;
-    int16_t *rec = heap_caps_malloc((size_t)max_frames * TDM_SLOTS * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-    int16_t *scratch = heap_caps_malloc(FRAMES_PER_READ * TDM_SLOTS * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-    int16_t *mono = heap_caps_malloc((size_t)max_frames * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-    if (rec == NULL || scratch == NULL || mono == NULL) {
+    s_head = heap_caps_malloc((size_t)HEAD_FRAMES * TDM_SLOTS * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    s_rec_ui_mux = xSemaphoreCreateMutex();
+    xTaskCreate(rec_ui_task, "rec_ui", 3072, NULL, 2, NULL);
+    s_scratch = heap_caps_malloc(FRAMES_PER_READ * TDM_SLOTS * sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (s_head == NULL || s_scratch == NULL) {
         ESP_LOGE(TAG, "buffer allocation failed");
         abort();
     }
-
-    ESP_LOGI(TAG, "ready: hold BOOT to talk (max %d s), release to send to the gateway",
-             CONFIG_ONURB_BRINGUP_MAX_RECORD_S);
+    s_mono_frames = MAX_RECORD_FRAMES;
+    s_mono = heap_caps_malloc((size_t)s_mono_frames * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (s_mono == NULL) {                        /* shouldn't happen (8 MB PSRAM); say so loudly */
+        size_t room = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+        s_mono_frames = (int)((room > 2 * 1024 * 1024 ? room - 2 * 1024 * 1024 : room / 2) / sizeof(int16_t));
+        s_mono_frames = s_mono_frames / FRAMES_PER_READ * FRAMES_PER_READ;
+        s_mono = heap_caps_malloc((size_t)s_mono_frames * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+        ESP_LOGE(TAG, "PSRAM can't hold %d s: recording limited to %.0f s", MAX_RECORD_S,
+                 (double)s_mono_frames / SAMPLE_RATE);
+        if (s_mono == NULL) {
+            abort();
+        }
+    }
+    onurb_ota_report_record_limit(s_mono_frames / SAMPLE_RATE,
+                                  heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
+    ESP_LOGI(TAG, "ready: hold BOOT to talk; recording limit %d s, PSRAM free after buffers %u KB",
+             s_mono_frames / SAMPLE_RATE, (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
 
     int idle_ticks = 0;
     while (true) {
         if (!button_pressed()) {
             vTaskDelay(pdMS_TO_TICKS(10));
+            gesture_turn();
+            pipeline_tick();
+            onurb_ota_tick();
+            onurb_screen_tick();
             if (++idle_ticks % 200 == 0) {       /* screen every 2 s */
                 ui_refresh();
             }
@@ -346,30 +1331,16 @@ void app_main(void)
         if (!button_pressed()) {
             continue;
         }
-
-        play_tone(880, 120);                     /* start cue, before the mic is read */
-        mic_flush(scratch, 200);
-        ESP_LOGI(TAG, "recording...");
-
-        int frames = 0;
-        onurb_ui_set_state(ONURB_UI_RECORDING, 0);
-        while (button_pressed() && frames + FRAMES_PER_READ <= max_frames) {
-            esp_codec_dev_read(s_mic, rec + (size_t)frames * TDM_SLOTS,
-                               FRAMES_PER_READ * TDM_SLOTS * sizeof(int16_t));
-            frames += FRAMES_PER_READ;
-            if (frames % (SAMPLE_RATE / 5) == 0) {   /* screen every 200 ms */
-                onurb_ui_set_state(ONURB_UI_RECORDING, (float)frames / SAMPLE_RATE);
-            }
+        onurb_ota_set_busy(true);                /* a background update pauses for the turn */
+        onurb_screen_hold();                     /* on for the recording / capture */
+        vTaskDelay(pdMS_TO_TICKS(200));
+        if (!button_pressed() && jobs_pending() == 0 && s_ui_mode == UI_IDLE) {
+            motion_capture();                    /* quick tap while idle = labelled IMU trace */
+            onurb_ui_set_state(ONURB_UI_IDLE, 0);
+        } else if (button_pressed()) {
+            record_and_queue(STOP_ON_RELEASE, NULL);   /* hold to talk, also while others process */
         }
-        ESP_LOGI(TAG, "stopped (%s)", button_pressed() ? "max length" : "released");
-        play_tone(660, 120);                     /* stop cue, after capture */
-
-        if (frames < SAMPLE_RATE / 4) {
-            ESP_LOGW(TAG, "too short, ignored");
-        } else {
-            run_turn(rec, frames, report_levels(rec, frames), mono);
-        }
-        onurb_ui_set_state(ONURB_UI_IDLE, 0);
+        onurb_screen_release();
         while (button_pressed()) {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
