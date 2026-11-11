@@ -530,6 +530,28 @@ static void thread_push_history(thread_t *t)
 
 static void threads_tick(int64_t now)
 {
+    /* A PROCESSING thread with no request in flight (dropped, finished elsewhere) would spin or
+     * say "Cancelling..." forever: remove it. Background tasks are WORKING, not PROCESSING. */
+    for (int i = s_nthreads - 1; i >= 0; i--) {
+        if (s_threads[i].state != TH_PROCESSING) {
+            continue;
+        }
+        bool has_job = false;
+        taskENTER_CRITICAL(&s_job_mux);
+        for (int k = 0; k < s_njobs; k++) {
+            has_job |= s_jobs[k]->thread == s_threads[i].id;
+        }
+        taskEXIT_CRITICAL(&s_job_mux);
+        if (!has_job && !s_uploading) {
+            ESP_LOGW(TAG, "thread %lu: processing with no request - removed", (unsigned long)s_threads[i].id);
+            if (s_threads[i].tid[0]) {
+                s_threads[i].state = TH_OPEN;    /* an answer that never went: the thread stays open */
+                s_threads_dirty = true;
+            } else {
+                thread_remove(s_threads[i].id);
+            }
+        }
+    }
     for (int i = s_nthreads - 1; i >= 0; i--) {
         if ((s_threads[i].state == TH_DONE || s_threads[i].state == TH_ERROR) &&
             now - s_threads[i].done_at > THREAD_DONE_TTL) {
@@ -751,7 +773,7 @@ static void cancel_worker(void *arg)
     vTaskDelete(NULL);
 }
 
-static void cancel_request(uint32_t thread)
+static bool cancel_request(uint32_t thread)
 {
     turn_job_t *job = NULL;
     uint32_t thread_id = 0;
@@ -783,7 +805,7 @@ static void cancel_request(uint32_t thread)
     }
     taskEXIT_CRITICAL(&s_job_mux);
     if (job == NULL) {
-        return;
+        return false;
     }
     char id[33];
     memcpy(id, job->turn_id, sizeof(id));        /* job may be freed by its worker any time now */
@@ -816,7 +838,7 @@ static void cancel_request(uint32_t thread)
         onurb_ui_cancel_taken();                 /* the cancelling tap doesn't count twice */
         s_ui_mode = UI_FEEDBACK;
         s_ui_until_us = esp_timer_get_time() + (int64_t)FEEDBACK_MS * 1000;
-        return;
+        return true;
     }
 #endif
     free(csv);
@@ -825,6 +847,7 @@ static void cancel_request(uint32_t thread)
     } else {
         notice("Cancelled", ONURB_UI_COLOR_BUSY, 1000);
     }
+    return true;
 }
 
 /* Present the oldest finished request (keeps request order). */
@@ -1136,7 +1159,10 @@ static void pipeline_tick(void)
             thread_remove(cancel_th);
         } else {
             ESP_LOGI(TAG, "cancel in thread %lu", (unsigned long)cancel_th);
-            cancel_request(cancel_th);
+            if (!cancel_request(cancel_th) && ct) {   /* no request behind it any more: just drop it */
+                ESP_LOGW(TAG, "thread %lu had no request to cancel - removed", (unsigned long)cancel_th);
+                thread_remove(cancel_th);
+            }
         }
     }
 #endif

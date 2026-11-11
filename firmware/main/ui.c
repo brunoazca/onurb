@@ -2096,7 +2096,9 @@ void onurb_ui_set_state(onurb_ui_state_t state, float seconds)
     ripple_set(state == ONURB_UI_RECORDING);
     updating_hide();
     wa_hide();
-    if (state == ONURB_UI_RECORDING) {
+    if (state == ONURB_UI_RECORDING && s_state == ONURB_UI_RECORDING) {
+        /* timer refresh (every 100 ms): leave the view alone, the user may be scrolling threads */
+    } else if (state == ONURB_UI_RECORDING) {
         wp_close(); /* talking takes over the screen; a pending join carries on */
         if (s_mic_rec_id != 0 && s_mic_rec_id == s_view_id) {
             s_mic_recording = true; /* answering this thread: stay on it */
