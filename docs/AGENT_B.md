@@ -94,3 +94,17 @@ watch shows preview ── Confirm ──▶ gateway executes it (agent never se
 - Known gaps: profile photos need `wacli profile picture-info`, which can't run while the
   user's `wacli sync --follow` holds the store, so initials are shown for now. Emoji
   render as boxes in the preview font.
+
+## Code tasks (2026-11-11)
+
+The user: "sim, mas nem me peça permissão. Só no repo do onurb." The agent's `start_code_task`
+hands a change to Onurb itself (firmware screens/behavior, gateway, the agent's own prompts) to a
+code worker that edits this repo and builds the firmware without asking; a good build is offered
+to the watch by OTA, and gateway code changes restart the gateway once the result reached the watch.
+
+- Scope: this repo only (Read/Edit/Write limited to it), `tools/onurb_build.sh`, `python3 -m
+  py_compile`, read-only git. Mac only (the toolchain lives there); one at a time.
+- No WhatsApp, web or browser in these sessions: nothing read from outside can steer the edits.
+- Denied: `firmware/sdkconfig` (secrets), `~/.config`, `gateway/received/`, commit/push/reset/
+  checkout, `rm`. Verified that the deny rules block Read and Grep technically.
+- The worker follows docs/WATCH_CONSTRAINTS.md before firmware changes.

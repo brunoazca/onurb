@@ -17,6 +17,8 @@ read-only, for Instinct's reply; the reply ends after REPLY_QUIET_S without a
 new message (docs/AGENT.md §4.1).
 """
 import argparse
+import atexit
+import signal
 import array
 import math
 import datetime as dt
@@ -24,6 +26,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -132,6 +135,16 @@ def voiced_seconds(wav_path):
     return n / 100
 
 
+def to_16k_mono(src, dst):
+    """16 kHz mono s16 WAV (STT input): afconvert on macOS, ffmpeg elsewhere."""
+    if shutil.which("afconvert"):
+        cmd = ["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", str(src), str(dst)]
+    else:
+        cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", str(src), "-ac", "1", "-ar", "16000",
+               "-c:a", "pcm_s16le", str(dst)]
+    subprocess.run(cmd, check=True, capture_output=True)
+
+
 def normalize(src, dst, target_dbfs=-22.0, max_gain_db=24.0):
     """Remove DC and raise quiet watch recordings toward target RMS (capped gain,
     hard clip). Returns the gain applied in dB."""
@@ -155,6 +168,7 @@ def normalize(src, dst, target_dbfs=-22.0, max_gain_db=24.0):
 SUPPORTED_LANGS = ("en", "pt")
 
 
+WHISPER_PROC = {}            # {"p": Popen} of whisper-server, for a clean self-restart
 WHISPER_SERVER = None        # "http://127.0.0.1:<port>" once whisper-server is up (model stays loaded)
 LANG_CODES = {"portuguese": "pt", "english": "en", "spanish": "es", "russian": "ru", "italian": "it",
               "french": "fr", "german": "de", "galician": "gl", "catalan": "ca", "japanese": "ja"}
@@ -290,8 +304,7 @@ def transcribe(wav_path, model, whisper_bin, fallback_lang="pt"):
         if gain_db >= 1.0:
             log(f"  input gain +{gain_db:.0f} dB")
         # whisper.cpp wants 16 kHz mono s16.
-        subprocess.run(["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", str(loud), str(wav16)],
-                       check=True, capture_output=True)
+        to_16k_mono(loud, wav16)
         if ELEVEN_KEY:
             try:
                 return _scribe(wav16, fallback_lang)
@@ -333,6 +346,13 @@ def speakable(text):
 def available_voices():
     out = subprocess.run(["say", "-v", "?"], capture_output=True, text=True).stdout
     return {line.split("  ")[0].strip() for line in out.splitlines() if line.strip()}
+
+
+def empty_wav(rate=None):
+    """A valid 0-sample WAV: the watch shows the text and plays nothing."""
+    rate = rate or WATCH_RATE
+    return struct.pack("<4sI4s4sIHHIIHH4sI", b"RIFF", 36, b"WAVE", b"fmt ", 16, 1, 1, rate, rate * 2, 2, 16,
+                       b"data", 0)
 
 
 def synthesize(text, lang, out_wav, voices):
@@ -443,6 +463,24 @@ def follow_instinct(turn, jid, sent_at, gateway):
     threading.Thread(target=run, daemon=True, name=f"instinct-{turn[:8]}").start()
 
 
+UPSTREAM = os.environ.get("ONURB_UPSTREAM", "").rstrip("/")   # server mode: the Mac's gateway
+UPSTREAM_UP = threading.Event()
+
+
+def watch_upstream():
+    """Every 10 s: is the Mac's gateway answering? (/v1/health, 2 s timeout)"""
+    while True:
+        try:
+            with urllib.request.urlopen(UPSTREAM + "/v1/health", timeout=2) as r:
+                up = r.status == 200
+        except OSError:
+            up = False
+        if up != UPSTREAM_UP.is_set():
+            log(f"Mac gateway {'UP - forwarding watch requests to it' if up else 'DOWN - handling requests here'}")
+            (UPSTREAM_UP.set if up else UPSTREAM_UP.clear)()
+        time.sleep(10)
+
+
 # --------------------------------------------------------------------------- firmware
 
 def firmware_image(path):
@@ -516,6 +554,14 @@ class Handler(BaseHTTPRequestHandler):
         detail = re.sub(r"[^0-9A-Za-z=;./-]", "", self.headers.get("X-Onurb-Detail", ""))[:96]
         out = RECEIVED / "gesture_feedback" / f"{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_{label}.csv"
         out.parent.mkdir(exist_ok=True)
+        if label == "wrong":   # same window posted earlier as "accepted" (dismissed turn): relabel it
+            for old_f in sorted(out.parent.glob("*_accepted.csv"))[-30:]:
+                if old_f.read_bytes() == body:
+                    out = old_f.with_name(old_f.name.replace("_accepted", "_wrong"))
+                    old_f.rename(out)
+                    old_f.with_suffix(".txt").unlink(missing_ok=True)
+                    log(f"  {old_f.name} -> {out.name} (dismissed: false trigger)")
+                    break
         out.write_bytes(body)
         (out.with_suffix(".txt")).write_text(f"label: {label}\ndetail: {detail}\n")
         who = {"rejected": "rule rejected", "accepted": "GESTURE -> turn"}.get(label, f"user says {label.upper()}")
@@ -523,17 +569,25 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, b'{"ok":true}')
 
     def _speak(self, reply, lang, base, headers=None):
-        """TTS + 200 audio/wav with the reply text for the screen."""
+        """200 audio/wav with the reply text for the screen (X-Onurb-Reply-Text).
+        Spoken audio only when the watch says it has somewhere to play it
+        (X-Onurb-Audio-Out: bt, a Bluetooth headset) or ONURB_TTS=1; otherwise
+        an empty WAV (the user reads the screen; no TTS cost, no macOS `say`)."""
         cfg = self.server.cfg
         reply = speakable(reply) or ("Ok." if lang != "pt" else "Certo.")
-        out = base.with_suffix(".reply.wav")
-        synthesize(reply, lang, out, cfg.voices)
-        if cfg.play_local:
-            subprocess.Popen(["afplay", str(out)])
+        want_audio = self.headers.get("X-Onurb-Audio-Out", "").lower() == "bt" or os.environ.get("ONURB_TTS") == "1"
+        if want_audio:
+            out = base.with_suffix(".reply.wav")
+            synthesize(reply, lang, out, cfg.voices)
+            if cfg.play_local:
+                subprocess.Popen(["afplay", str(out)])
+            body = out.read_bytes()
+        else:
+            body = empty_wav()
         shown = urllib.parse.quote(reply[:REPLY_TEXT_MAX], safe=" ,.;:!?'()-")
         h = {"X-Onurb-Language": lang, "X-Onurb-Reply-Text": shown}
         h.update(headers or {})
-        self._send(200, out.read_bytes(), "audio/wav", h)
+        self._send(200, body, "audio/wav", h)
 
     def _authorized(self):
         cfg = self.server.cfg
@@ -560,6 +614,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/internal/background":
             tid = agent.start_task(body.get("task", ""), turn, f"http://127.0.0.1:{cfg.port}")
             return self._send(200, json.dumps({"task_id": tid}).encode())
+        if self.path == "/internal/code":
+            tid, err = agent.start_code_task(body.get("task", ""), turn, f"http://127.0.0.1:{cfg.port}")
+            return self._send(200, json.dumps({"task_id": tid, "error": err}).encode())
         if self.path == "/internal/tasks":
             return self._send(200, json.dumps({"tasks": agent.list_tasks()}).encode())
         if self.path == "/internal/tasks/cancel":
@@ -635,9 +692,47 @@ class Handler(BaseHTTPRequestHandler):
             log(f"turn {turn[:8]}: CANCEL requested by the watch")
         self._send(200, b'{"ok":true}')
 
+    def _proxied(self, method):
+        """Server mode (docs/SERVER.md): the Mac's gateway handles watch requests
+        while it's up (ONURB_UPSTREAM, over Tailscale); this one only when it isn't.
+        Returns True if the request was answered by the upstream."""
+        if not UPSTREAM or not UPSTREAM_UP.is_set() or not self.path.startswith("/v1/"):
+            return False
+        n = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(n) if method == "POST" and n else None
+        hop = {"host", "content-length", "connection", "cf-access-client-id", "cf-access-client-secret",
+               "cf-access-jwt-assertion", "cf-connecting-ip", "cf-ray", "cf-ipcountry", "cf-visitor", "cdn-loop",
+               "x-forwarded-for", "x-forwarded-proto"}
+        hdrs = {k: v for k, v in self.headers.items() if k.lower() not in hop}
+        req = urllib.request.Request(UPSTREAM + self.path, data=body, headers=hdrs, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=320) as r:
+                status, rh, data = r.status, r.headers, r.read()
+        except urllib.error.HTTPError as e:
+            status, rh, data = e.code, e.headers, e.read()
+        except OSError as e:
+            if body is not None:          # the body is consumed: can't fall back for this one
+                log(f"upstream (Mac) failed mid-request {self.path}: {e}")
+                UPSTREAM_UP.clear()
+                self._send(502, b'{"error":"upstream failed"}')
+                return True
+            log(f"upstream (Mac) unreachable ({e}); handling {self.path} here")
+            UPSTREAM_UP.clear()
+            return False
+        self.send_response(status)
+        for k, v in rh.items():
+            if k.lower() in ("content-type",) or k.lower().startswith("x-onurb-"):
+                self.send_header(k, v)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+        return True
+
     def do_GET(self):
-        if self.path == "/healthz":
+        if self.path in ("/healthz", "/v1/health"):
             return self._send(200, b'{"ok":true}')
+        if self._proxied("GET"):
+            return
         if self.path in ("/v1/firmware/info", "/v1/firmware/image"):
             return self._firmware()
         if self.path.startswith("/v1/actions/"):
@@ -656,8 +751,27 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(404, "no complete firmware image")
         digest = image[-32:].hex()
         running = re.sub(r"[^0-9a-f]", "", self.headers.get("X-Onurb-Running", ""))[:64]
-        status = re.sub(r"[^0-9A-Za-z_=;.]", "", self.headers.get("X-Onurb-Status", ""))[:128]
-        boot = re.sub(r";up=\d+s", "", status)           # uptime changes every check
+        status = re.sub(r"[^0-9A-Za-z_=;.]", "", self.headers.get("X-Onurb-Status", ""))[:256]
+        boot = re.sub(r";up=\d+s|;batt=-?\d+|;mv=\d+|;chg=\d|;usb=\d|;jobs=\d+|;spool=\d+|;scr_\w+=\d+|;iram_kb=\d+|;iblk_kb=\d+", "", status)   # changes every check
+        b = dict(re.findall(r"(batt|mv|chg|usb|jobs|spool)=(-?\d+)", status))
+        if b:   # battery log (power work, 2026-11-10): drain per hour awake vs dozing
+            upm = re.search(r"up=(\d+)s", status)
+            bat = RECEIVED / "battery.csv"
+            new = not bat.exists()
+            with open(bat, "a") as f:
+                if new:
+                    f.write("time,percent,mv,charging,usb,uptime_s\n")
+                f.write(f"{dt.datetime.now():%Y-%m-%d %H:%M:%S},{b.get('batt')},{b.get('mv')},{b.get('chg')},"
+                        f"{b.get('usb')},{upm.group(1) if upm else ''}\n")
+            if b.get("batt") != getattr(self.server, "watch_batt", None):
+                self.server.watch_batt = b.get("batt")
+                log(f"watch battery {b.get('batt')}% ({b.get('mv')} mV" + (", charging" if b.get("chg") == "1" else "")
+                    + f"; {b.get('jobs', '?')} requests in flight, {b.get('spool', '?')} queued offline)")
+        scr = dict(re.findall(r"scr_(dtap|rej|hold)=(\d+)", status))
+        if scr and scr != getattr(self.server, "watch_scr", None):   # what lights the screen (since boot)
+            self.server.watch_scr = scr
+            log(f"watch screen since boot: {scr.get('dtap')} double taps, {scr.get('rej')} touches rejected "
+                f"(resting/flicker), {scr.get('hold')} lit by the firmware")
         up = re.search(r"up=(\d+)s", status)
         prev_up = getattr(self.server, "watch_up", None)
         if up:
@@ -676,6 +790,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         cfg = self.server.cfg
+        if self._proxied("POST"):
+            return
         if self.path == "/v1/imu-log":
             return self._imu_log()
         if self.path == "/v1/gesture-feedback":
@@ -720,8 +836,9 @@ class Handler(BaseHTTPRequestHandler):
                 note = "(recorded offline, sent late) "
         tilt = self.headers.get("X-Onurb-Tilt", "")
         thread = re.sub(r"[^0-9a-f]", "", self.headers.get("X-Onurb-Thread", ""))[:32] or None
+        rec = re.sub(r"[^0-9a-z=;._]", "", self.headers.get("X-Onurb-Rec", ""))[:48]
         log(f"turn {turn[:8]}: {len(pcm) / (2 * rate):.1f} s @ {rate} Hz, body {t_up:.2f} s"
-            + (f", tilt {tilt}" if tilt else "") + (" [queued]" if queued else ""))
+            + (f", tilt {tilt}" if tilt else "") + (f", rec {rec}" if rec else "") + (" [queued]" if queued else ""))
 
         if TURN_LOCK.locked():
             log(f"  turn {turn[:8]} waits for the previous turn (one at a time keeps replies in order)")
@@ -755,6 +872,10 @@ class Handler(BaseHTTPRequestHandler):
                 elif cfg.brain == "instinct":
                     reply = brain_instinct(text, lang, cfg.instinct_jid, note)
                     state = "open" if reply.rstrip().endswith("?") else "done"
+                elif cfg.brain == "offline":   # server without its own agent yet (docs/SERVER.md)
+                    reply = ("O Mac está desligado e o servidor ainda não tem o agente; tente quando o Mac ligar."
+                             if lang == "pt" else "The Mac is off and the server has no agent yet; try when the Mac is on.")
+                    state = "done"
                 else:
                     reply = brain_echo(text, lang)
                     state = "done"
@@ -786,7 +907,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8080)
-    ap.add_argument("--brain", choices=["echo", "instinct", "onurb"], default="echo")
+    ap.add_argument("--brain", choices=["echo", "instinct", "onurb", "offline"], default="echo")
     ap.add_argument("--instinct-jid", default=os.environ.get("ONURB_INSTINCT_JID", ""),
                     help="Instinct's WhatsApp JID (or env ONURB_INSTINCT_JID; never commit it)")
     ap.add_argument("--token", default=os.environ.get("ONURB_API_TOKEN", ""))
@@ -802,11 +923,30 @@ def main():
     if cfg.brain in ("instinct", "onurb") and not cfg.instinct_jid:
         sys.exit(f"--brain {cfg.brain} needs --instinct-jid or ONURB_INSTINCT_JID")
     if not cfg.model.exists():
-        sys.exit(f"whisper model not found: {cfg.model}")
+        if not ELEVEN_KEY:
+            sys.exit(f"whisper model not found: {cfg.model} (and no ElevenLabs key for cloud STT)")
+        log(f"no whisper model ({cfg.model}): cloud STT only, no local fallback")
+        cfg.model = None
     RECEIVED.mkdir(exist_ok=True)
-    cfg.voices = available_voices()
+    try:
+        cfg.voices = available_voices()       # macOS `say`; absent on a Linux server
+    except (OSError, subprocess.SubprocessError):
+        cfg.voices = set()
 
-    start_whisper_server(cfg.model)
+    if cfg.model and shutil.which("whisper-server"):
+        wproc = start_whisper_server(cfg.model)
+        WHISPER_PROC["p"] = wproc
+        if wproc:   # don't leave the model-holding child behind when the gateway is stopped/restarted
+            atexit.register(wproc.terminate)
+            signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    def restart_self():
+        """After a code task changed the gateway's code: re-exec with the same argv/env."""
+        if cfg.model and WHISPER_PROC.get("p"):
+            WHISPER_PROC["p"].terminate()
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    agent.RESTART_HOOK = restart_self
+    if UPSTREAM:
+        threading.Thread(target=watch_upstream, daemon=True, name="upstream").start()
     srv = ThreadingHTTPServer((cfg.host, cfg.port), Handler)
     srv.cfg = cfg
     log(f"Onurb gateway on {cfg.host}:{cfg.port}, brain={cfg.brain}, play_local={cfg.play_local}")

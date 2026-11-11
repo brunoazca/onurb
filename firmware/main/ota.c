@@ -14,6 +14,7 @@
 #include "freertos/task.h"
 
 #include "ota.h"
+#include "api.h"
 #include "screen.h"
 #include "spool.h"
 #include "ui.h"
@@ -26,7 +27,25 @@ static const char *TAG = "onurb_ota";
 static bool s_pending_verify;
 static int64_t s_next_check_us;           /* 0 = check as soon as Wi-Fi is up */
 static char s_running_hex[65];
+static char s_power_status[160];           /* "batt=..;mv=..;chg=..;doze=.." (power telemetry) */
 static char s_device_status[64];          /* "rec_limit_s=..;psram_free_kb=.." for the gateway log */
+
+/* Checks cost radio time (battery): hourly (CONFIG_ONURB_OTA_CHECK_MIN), plus one when
+ * the user wakes the watch / opens the screen, at most every CHECK_SOON_MIN_S. */
+#define CHECK_SOON_MIN_S (15 * 60)
+static int64_t s_last_check_us;
+
+void onurb_ota_check_soon(void)
+{
+    if (s_last_check_us == 0 || esp_timer_get_time() - s_last_check_us >= (int64_t)CHECK_SOON_MIN_S * 1000000) {
+        s_next_check_us = 0;
+    }
+}
+
+void onurb_ota_set_power_status(const char *s)
+{
+    strlcpy(s_power_status, s, sizeof(s_power_status));
+}
 
 void onurb_ota_report_record_limit(int seconds, unsigned psram_free_kb)
 {
@@ -57,13 +76,11 @@ void onurb_ota_boot_info(void)
              s_pending_verify ? " - NEW, pending verify" : "");
 }
 
+static const char *s_ota_base;            /* base the current image download uses */
+
 static esp_err_t set_auth(esp_http_client_handle_t client)
 {
-    if (strlen(CONFIG_ONURB_API_TOKEN) > 0) {
-        char auth[128];
-        snprintf(auth, sizeof(auth), "Bearer %s", CONFIG_ONURB_API_TOKEN);
-        esp_http_client_set_header(client, "Authorization", auth);
-    }
+    onurb_api_headers(client, s_ota_base ? s_ota_base : onurb_api_base());
     return ESP_OK;
 }
 
@@ -71,7 +88,9 @@ static esp_err_t set_auth(esp_http_client_handle_t client)
 static bool fetch_info(char digest[65])
 {
     char url[160], body[256];
-    snprintf(url, sizeof(url), "%s/v1/firmware/info", CONFIG_ONURB_API_BASE_URL);
+    const char *base = onurb_api_base();
+    s_ota_base = base;
+    snprintf(url, sizeof(url), "%s/v1/firmware/info", base);
     esp_http_client_config_t cfg = {
         .url = url,
         .timeout_ms = 5000,
@@ -88,13 +107,17 @@ static bool fetch_info(char digest[65])
                                           "wdt", "deepsleep", "brownout", "sdio", "usb", "jtag", "efuse",
                                           "pwr_glitch", "cpu_lockup"};
     int r = (int)esp_reset_reason();
-    char status[128];
-    snprintf(status, sizeof(status), "%s;reset=%s;up=%llds", s_device_status,
+    static char status[288];   /* may run on the main task (small stack) */
+    snprintf(status, sizeof(status), "%s;%s;reset=%s;up=%llds", s_device_status, s_power_status,
              r >= 0 && r < (int)(sizeof(reasons) / sizeof(reasons[0])) ? reasons[r] : "other",
              (long long)(esp_timer_get_time() / 1000000));
     esp_http_client_set_header(c, "X-Onurb-Status", status);
     bool ok = false;
-    if (esp_http_client_open(c, 0) == ESP_OK && esp_http_client_fetch_headers(c) >= 0 &&
+    bool opened = esp_http_client_open(c, 0) == ESP_OK;
+    if (!opened) {
+        onurb_api_failed(base);            /* the next check tries the other gateway */
+    }
+    if (opened && esp_http_client_fetch_headers(c) >= 0 &&
         esp_http_client_get_status_code(c) == 200) {
         int n = esp_http_client_read(c, body, sizeof(body) - 1);
         if (n > 0) {
@@ -139,8 +162,26 @@ static void ui_progress(int pct)
 
 static void ota_task(void *arg)
 {
+    /* The check runs here, not on the main task: away from home it is HTTPS and
+     * the TLS handshake overflowed the main task's stack (reboots every check). */
+    char digest[65];
+    if (!fetch_info(digest)) {
+        ESP_LOGD(TAG, "no firmware offered");
+        s_task_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+    if (strcmp(digest, s_running_hex) == 0) {
+        ESP_LOGI(TAG, "firmware up to date (%.12s)", digest);
+        s_task_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+    memcpy(s_offered_hex, digest, sizeof(s_offered_hex));
+
     char url[160];
-    snprintf(url, sizeof(url), "%s/v1/firmware/image", CONFIG_ONURB_API_BASE_URL);
+    s_ota_base = onurb_api_base();
+    snprintf(url, sizeof(url), "%s/v1/firmware/image", s_ota_base);
     esp_http_client_config_t http = {
         .url = url,
         .timeout_ms = 15000,
@@ -170,7 +211,7 @@ static void ota_task(void *arg)
                 ESP_LOGI(TAG, "turn started - download dropped, retry when idle");
                 break;
             }
-            if (!shown) {
+            if (!shown && onurb_screen_is_on()) {   /* background update: don't light a dark screen */
                 shown = true;
                 last_pct = -2;
                 onurb_screen_hold();
@@ -180,7 +221,7 @@ static void ota_task(void *arg)
                 break;
             }
             int pct = total > 0 ? (int)(100LL * esp_https_ota_get_image_len_read(ota) / total) : -1;
-            if (pct / 2 != last_pct / 2 && pct < 100 && !s_busy) {   /* screen every 2 % */
+            if (shown && pct / 2 != last_pct / 2 && pct < 100 && !s_busy) {   /* screen every 2 % */
                 last_pct = pct;
                 ui_progress(pct);
             }
@@ -232,9 +273,11 @@ bool onurb_ota_tick(void)
             return false;
         }
         ESP_LOGI(TAG, "idle - restarting into %.12s", s_offered_hex);
-        onurb_screen_hold();
-        ui_progress(100);
-        vTaskDelay(pdMS_TO_TICKS(800));
+        if (onurb_screen_is_on()) {
+            onurb_screen_hold();
+            ui_progress(100);
+            vTaskDelay(pdMS_TO_TICKS(800));
+        }
         esp_restart();
     }
     static int64_t idle_since_us;
@@ -245,25 +288,32 @@ bool onurb_ota_tick(void)
         s_retry_soon = false;
         s_next_check_us = 0;                   /* dropped/failed download: try again now */
     }
-    if (s_task_running || !online || now < s_next_check_us || s_busy) {
+    static int64_t busy_since_us;
+    if (!s_busy) {
+        busy_since_us = 0;
+    } else if (busy_since_us == 0) {
+        busy_since_us = now;
+    }
+    /* "busy" that lasts 15 min is a stuck state, not a turn: check anyway, so a fix can arrive. */
+    bool stuck = s_busy && busy_since_us && now - busy_since_us > 15LL * 60 * 1000000;
+    if (s_task_running || !online || now < s_next_check_us || (s_busy && !stuck)) {
         return false;                          /* never start a download during a turn */
     }
+    if (stuck) {
+        ESP_LOGW(TAG, "busy for 15+ min - checking for an update anyway");
+    }
     s_next_check_us = now + (int64_t)CONFIG_ONURB_OTA_CHECK_MIN * 60 * 1000000;
+    s_last_check_us = now;
 
-    char digest[65];
-    if (!fetch_info(digest)) {
-        ESP_LOGD(TAG, "no firmware offered");
-        return false;
-    }
-    if (strcmp(digest, s_running_hex) == 0) {
-        ESP_LOGI(TAG, "firmware up to date (%.12s)", digest);
-        return false;
-    }
-    memcpy(s_offered_hex, digest, sizeof(s_offered_hex));
-    s_task_running = true;
+    s_task_running = true;                     /* check + download in their own task */
     if (xTaskCreatePinnedToCore(ota_task, "ota", 8192, NULL, 2, NULL, 0) != pdPASS) {
         s_task_running = false;
         ESP_LOGE(TAG, "no memory for the update task");
     }
     return false;
+}
+
+bool onurb_ota_busy_downloading(void)
+{
+    return s_task_running;
 }

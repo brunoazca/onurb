@@ -16,6 +16,10 @@ const char *onurb_wifi_state_text(void);
  * Matches onurb_ui_wifi_t. */
 int onurb_wifi_level(void);
 
+/* Power: switch the radio off while the watch dozes / back on (reconnects). */
+void onurb_wifi_doze(bool on);
+bool onurb_wifi_dozing(void);
+
 /* SSID the station is using or trying ("" if none). */
 const char *onurb_wifi_ssid(void);
 

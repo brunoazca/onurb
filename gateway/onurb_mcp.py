@@ -58,6 +58,17 @@ TOOLS = [
                         "required": ["task"]},
     },
     {
+        "name": "start_code_task",
+        "description": (
+            "Change Onurb itself: the watch firmware (screens, buttons, timeouts, behavior), the "
+            "gateway, or your own prompts/tools. Pre-approved by the user: no confirmation needed. "
+            "A code worker edits the Onurb repo, builds the firmware (the watch updates itself) and "
+            "the result reaches the watch when done. Describe the change completely: what the user "
+            "wants, in their words, which screen/behavior, and edge cases."),
+        "inputSchema": {"type": "object", "properties": {"task": {"type": "string"}},
+                        "required": ["task"]},
+    },
+    {
         "name": "list_background_tasks",
         "description": ("List the background tasks started since the gateway last restarted: id, "
                         "state (running / done / cancelled), minutes since start and the task text."),
@@ -98,6 +109,11 @@ def run_tool(name, args):
     if name == "start_background_task":
         r = call_gateway("/internal/background", {"task": args.get("task", ""), "turn": TURN})
         return f"Started (task {r.get('task_id')}). The result will reach the user's watch when done."
+    if name == "start_code_task":
+        r = call_gateway("/internal/code", {"task": args.get("task", ""), "turn": TURN})
+        if r.get("error"):
+            return "Not started: " + r["error"]
+        return f"Started (code task {r.get('task_id')}). The result will reach the user's watch when done."
     if name == "list_background_tasks":
         tasks = call_gateway("/internal/tasks", {}).get("tasks", [])
         return json.dumps(tasks, ensure_ascii=False) if tasks else "No background tasks since the gateway started."

@@ -58,7 +58,31 @@ READ_TOOLS = [
 ]
 ONURB_TOOLS = ["mcp__onurb__route_to_instinct", "mcp__onurb__propose_whatsapp",
                "mcp__onurb__start_background_task", "mcp__onurb__list_background_tasks",
-               "mcp__onurb__cancel_background_task"]
+               "mcp__onurb__cancel_background_task", "mcp__onurb__start_code_task"]
+
+# Code tasks (2026-11-11, the user: "sim, mas nem me peça permissão. Só no repo do onurb"):
+# edit/build Onurb itself without asking. Scope: this repo only. No WhatsApp, web or browser
+# in these sessions, so nothing read from outside can steer the edits. Secrets stay unreadable
+# (firmware/sdkconfig holds Wi-Fi, Instinct's chat and the Cloudflare token; ~/.config/onurb).
+# One local commit per task (only the files it changed); push stays with the user's sessions.
+REPO = HERE.parent
+CODE_TOOLS = [
+    f"Read(/{REPO}/**)", f"Edit(/{REPO}/**)", f"Write(/{REPO}/**)", "Grep", "Glob",
+    "Bash(./tools/onurb_build.sh)", f"Bash({REPO}/tools/onurb_build.sh)",
+    "Bash(python3 -m py_compile:*)", "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)",
+    "Bash(git add:*)", "Bash(git commit:*)",   # one local commit per task; push stays with the user
+    "Bash(ls:*)",
+]
+CODE_NEVER = [
+    f"Read(/{REPO}/firmware/sdkconfig)", f"Edit(/{REPO}/firmware/sdkconfig)", f"Write(/{REPO}/firmware/sdkconfig)",
+    f"Read(/{REPO}/firmware/sdkconfig.old)", f"Read(/{Path.home()}/.config/**)",
+    f"Read(/{REPO}/gateway/received/**)", f"Edit(/{REPO}/gateway/received/**)",
+    "Bash(git push:*)", "Bash(git reset:*)", "Bash(git checkout:*)", "Bash(git rebase:*)",
+    "Bash(git add -A:*)", "Bash(git add .:*)", "Bash(git commit -a:*)", "Bash(git commit --amend:*)",
+    "Bash(rm:*)", "WebSearch", "WebFetch", "Task", "NotebookEdit",
+]
+CODE_TIMEOUT_S = 40 * 60
+RESTART_HOOK = None                # set by the gateway: restarts it after a code task changed its code
 NEVER = ["Bash(wacli send:*)", "Bash(wacli --read-only send:*)", "Bash(wacli messages send:*)",
          "Write", "Edit", "NotebookEdit", "Task",
          "Bash(herdr pane send-text:*)", "Bash(herdr pane send-keys:*)", "Bash(herdr pane run:*)",
@@ -68,6 +92,24 @@ NEVER = ["Bash(wacli send:*)", "Bash(wacli --read-only send:*)", "Bash(wacli mes
 # The agent now runs with dontAsk (anything not in --allowedTools is denied) and
 # without the user's own settings/allow-lists.
 SANDBOX = ["--permission-mode", "dontAsk", "--setting-sources", "project"]
+
+HOST = os.environ.get("ONURB_HOST", "mac")      # "mac" today; "server" after the move (docs/SERVER.md)
+MAC_NOTE = ("""
+What needs the user's Mac (you run ON it now, so all of it is local):
+- herdr and the agents in it; Chrome with the user's logins (computer use on Blackbone, LinkedIn, etc.);
+  Claude Code session transcripts (~/.claude/projects); WhatsApp Desktop's contact photos.
+- Claude in Chrome may list two browsers: "macOS" (the user's Chrome, on this Mac) and "Linux" (the server's
+  Chrome). Select the macOS one.""" if HOST == "mac" else """
+What needs the user's Mac (you run on a server; the Mac is a remote worker that may be off or asleep):
+- herdr and its agents: `herdr --machine mac ...` (over SSH). Chrome with the user's personal logins and
+  Claude Code session transcripts are only on the Mac.
+- Claude in Chrome may list two browsers: select the "Linux" one (this server's Chrome: logged into claude.ai and
+  Blackbone). The "macOS" one is the user's own Chrome; use it only for a site that is logged in only there,
+  and only if it is connected.
+- The server has its own Chrome for computer use (sites it is logged into), WhatsApp (wacli), email via
+  Instinct, calendar/Granola connectors, web research: those work without the Mac.
+- If a task needs the Mac and it doesn't answer, say so in one sentence and offer to retry later; never
+  pretend it worked.""")
 
 TURN_PROMPT = """You are Onurb, the user's wrist voice assistant (a smartwatch). The user spoke the request below; your reply is spoken aloud by a small watch speaker and shown on a tiny screen.
 
@@ -85,11 +127,13 @@ What you can do:
 - Groceries, to-dos, reminders, or anything Instinct already handles: route_to_instinct, then relay its answer briefly.
 - herdr: quick things (what's blocked, answer a prompt, prompt an agent) directly with the herdr skill; watching it over time ("fica olhando") as a background task.
 - Anything long (deep research, multi-step browsing, computer use): start_background_task with a complete description, then reply that you're on it.
+- Changes to Onurb itself (the watch's screens/behavior/firmware, the gateway, your own prompts or tools): start_code_task with a complete spec of what the user wants (their words, the screen or behavior involved, edge cases). Don't ask for confirmation: the user pre-approved code changes to Onurb. Ask only if the request itself is ambiguous. Then say you're on it.
 
 Names (speech-to-text often mangles them; map them back):
 - Instinct ("instint", "instinto", "insting", "in sync"): the user's OTHER AI assistant, which lives on WhatsApp and has the user's mailbox, groceries, to-dos and reminders. "Manda pro Instinct" / "pede pro Instinct" / "manda um Instinct" = call route_to_instinct with the request. Never message Instinct through wacli.
 - herdr ("hoarder", "herd", "herder", "Herd"): the user's terminal workspace running many Claude Code agents, on THIS Mac. You control it directly with the `herdr` CLI (no Cloudflare tunnel needed; that is only how Instinct, which runs elsewhere, reaches it): list agents, read their screens, prompt them, answer their permission prompts, start agents. Load the `herdr` skill first for the commands and the user's approval rules (approve read-only lookups such as MCP searches and read-only SQL; never approve writes, deletes, deploys, pushes or sending messages: tell the user).
 - wacli ("wacky"): the WhatsApp CLI. Blackbone / My Network: the user's company and its network product. Onurb: you.
+{MAC_NOTE}
 
 Never spend money, accept terms, delete things, or send messages/emails yourself. Those need the user's explicit confirmation: use propose_whatsapp, or Instinct, whose own confirmation rule applies."""
 
@@ -100,8 +144,41 @@ Names (speech-to-text often mangles them; map them back):
 - Instinct ("instint", "instinto", "insting", "in sync"): the user's OTHER AI assistant, which lives on WhatsApp and has the user's mailbox, groceries, to-dos and reminders. "Manda pro Instinct" / "pede pro Instinct" / "manda um Instinct" = call route_to_instinct with the request. Never message Instinct through wacli.
 - herdr ("hoarder", "herd", "herder", "Herd"): the user's terminal workspace running many Claude Code agents, on THIS Mac. You control it directly with the `herdr` CLI (no Cloudflare tunnel needed; that is only how Instinct, which runs elsewhere, reaches it): list agents, read their screens, prompt them, answer their permission prompts, start agents. Load the `herdr` skill first for the commands and the user's approval rules (approve read-only lookups such as MCP searches and read-only SQL; never approve writes, deletes, deploys, pushes or sending messages: tell the user).
 - wacli ("wacky"): the WhatsApp CLI. Blackbone / My Network: the user's company and its network product. Onurb: you.
+{MAC_NOTE}
 
 Finish with a line `SPOKEN: <one or two short sentences>` in the user's language summarizing the result for the watch speaker. Put the full result above it."""
+CODE_PROMPT = f"""You are Onurb's code worker. The user (Bruno) asked, by voice from their watch, for a change to
+Onurb itself. You may edit files in the Onurb repo ({REPO}) and build the watch firmware, without asking
+anyone: the user pre-approved this. Only this repo; nothing else on the machine.
+
+Repo map: firmware/main/*.c (ESP32-S3 watch, ESP-IDF + LVGL; ui.c = screens, bringup_main.c = main loop,
+screen.c = screen power, turn.c/api.c = gateway calls, wifi.c, ota.c), gateway/onurb_gateway.py (HTTP
+gateway, STT, Instinct), gateway/onurb_agent.py (your own prompts and tools), gateway/onurb_mcp.py,
+docs/SPEC.md, docs/WATCH_CONSTRAINTS.md.
+
+Rules:
+- Before any firmware change read docs/WATCH_CONSTRAINTS.md and follow it (internal RAM is scarce: big
+  buffers in PSRAM, no bigger stacks, no new periodic radio/screen activity; HTTPS needs stack).
+- Keep changes minimal and in the style of the surrounding code. Comment the why, briefly.
+- Firmware: after editing, run `./tools/onurb_build.sh` (from the repo root) until it prints BUILD OK.
+  A good build is offered to the watch automatically. Never leave a failing build: fix it or revert
+  your edits.
+- Gateway/agent Python: run `python3 -m py_compile <file>` on what you changed. The gateway restarts
+  itself after this task when its code changed.
+- Never read, print or copy secrets: firmware/sdkconfig (Wi-Fi, Instinct's chat, tokens), ~/.config,
+  .env files. This is a public repo: no names of private people, hosts, IPs, phone numbers or keys in code.
+- When done (and the build is OK), commit only the files you changed, by path:
+  `git add <file> <file>` then `git commit -m "onurb: <what changed> (voice request)"`. Never `git add -A`/`.`,
+  never amend, push, reset or delete files; leave other uncommitted changes alone (they are someone else's).
+- If the request is unclear or risky (e.g. could brick the watch), do the safe part and say what is left.
+
+Finish with a line `SPOKEN: <one or two short sentences, in Portuguese>` saying what changed and whether it
+was built (e.g. "Pronto: a tela das conversas agora apaga em 1 minuto; o relógio atualiza na próxima
+checagem."). Put the details above it."""
+
+TURN_PROMPT = TURN_PROMPT.replace("{MAC_NOTE}", MAC_NOTE)
+TASK_PROMPT = TASK_PROMPT.replace("{MAC_NOTE}", MAC_NOTE)
+
 
 # ------------------------------------------------------------------ state
 LOCK = threading.Lock()
@@ -142,19 +219,19 @@ def _mcp_config(turn, gateway):
 
 
 def _claude(prompt, system, model, tools, turn, gateway, resume=None, timeout=TURN_TIMEOUT_S, chrome=False,
-            on_start=None):
+            on_start=None, never=None, cwd=None):
     """Run claude -p; returns (result text, session id). on_start(proc) lets a caller cancel it."""
     mcp = _mcp_config(turn, gateway)
     args = ["claude", "-p", prompt, "--output-format", "json", "--model", model,
             "--append-system-prompt", system, "--mcp-config", mcp,
-            "--allowedTools", *tools, "--disallowedTools", *NEVER, *SANDBOX]
+            "--allowedTools", *tools, "--disallowedTools", *(never or NEVER), *SANDBOX]
     if resume:
         args += ["--resume", resume]
     if chrome:
         args += ["--chrome"]
     try:
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                cwd=str(RECEIVED), stdin=subprocess.DEVNULL, start_new_session=True)
+                                cwd=str(cwd or RECEIVED), stdin=subprocess.DEVNULL, start_new_session=True)
         if on_start:
             on_start(proc)
         try:
@@ -560,6 +637,67 @@ def start_task(task, turn, gateway, lang_hint="pt"):
         log(f"task {tid}: done in {(time.monotonic() - t0) / 60:.1f} min -> watch inbox: {spoken!r}")
     threading.Thread(target=work, daemon=True, name=f"task-{tid}").start()
     return tid
+
+
+def _code_mtimes():
+    return {str(f): f.stat().st_mtime for f in (REPO / "gateway").glob("*.py")}
+
+
+def start_code_task(task, turn, gateway, lang_hint="pt"):
+    """Edit/build Onurb itself (see CODE_TOOLS). One at a time; Mac only (the repo lives here)."""
+    if HOST != "mac":
+        return None, "code tasks run on the Mac (the repo and the firmware toolchain are there)"
+    with LOCK:
+        if any(t["state"] == "running" and t.get("kind") == "code" for t in TASKS.values()):
+            return None, "another code task is still running; try again when it finishes"
+        tid = uuid.uuid4().hex[:8]
+        TASKS[tid] = {"task": task, "started": time.monotonic(), "state": "running", "proc": None,
+                      "turn": turn, "kind": "code"}
+    def started(proc):
+        with LOCK:
+            TASKS[tid]["proc"] = proc
+            cancelled = TASKS[tid]["state"] == "cancelled"
+        if cancelled:
+            _kill(proc)
+    def work():
+        t0 = time.monotonic()
+        before = _code_mtimes()
+        log(f"code task {tid}: started: {task[:120]!r}")
+        try:
+            text, _ = _claude(task, CODE_PROMPT, TASK_MODEL, CODE_TOOLS, f"code-{tid}", gateway,
+                              timeout=CODE_TIMEOUT_S, on_start=started, never=CODE_NEVER, cwd=REPO)
+        except Exception as e:  # noqa: BLE001
+            text = f"SPOKEN: A mudança no Onurb falhou: {str(e)[:80]}"
+        with LOCK:
+            cancelled = TASKS[tid]["state"] == "cancelled"
+            TASKS[tid]["proc"] = None
+            if not cancelled:
+                TASKS[tid]["state"] = "done"
+        if cancelled:
+            log(f"code task {tid}: cancelled after {(time.monotonic() - t0) / 60:.1f} min")
+            return
+        out = RECEIVED / "tasks"
+        out.mkdir(exist_ok=True)
+        (out / f"{time.strftime('%Y%m%d_%H%M%S')}_code_{tid}.md").write_text(f"# Code task {tid}\n\n{task}\n\n---\n\n{text}\n")
+        m = re.search(r"SPOKEN:\s*(.+)", text, re.S)
+        spoken = (m.group(1) if m else text).strip().splitlines()[0][:300]
+        with LOCK:
+            thread = TASKS[tid].get("turn") or ""
+            INBOX.append((spoken, lang_hint, tid, thread, None))
+        if thread in THREADS:
+            _remember_thread(thread, reply=spoken, state="done")
+        log(f"code task {tid}: done in {(time.monotonic() - t0) / 60:.1f} min -> watch inbox: {spoken!r}")
+        if _code_mtimes() != before and RESTART_HOOK:
+            # The gateway's own code changed: restart once the watch has the result (the inbox is in memory).
+            for _ in range(180):
+                with LOCK:
+                    if not any(item[2] == tid for item in INBOX):
+                        break
+                time.sleep(1)
+            log(f"code task {tid}: gateway code changed - restarting the gateway")
+            RESTART_HOOK()
+    threading.Thread(target=work, daemon=True, name=f"code-{tid}").start()
+    return tid, None
 
 
 def inbox_pop():

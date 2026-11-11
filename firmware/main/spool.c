@@ -73,6 +73,12 @@ esp_err_t onurb_spool_save(const int16_t *pcm, size_t samples, uint32_t sample_r
     if (s_lock == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
+    if (esp_spiffs_info(LABEL, &total, &used) == ESP_OK && used + need + RESERVE > total) {
+        /* SPIFFS counts deleted (sent) files as used until garbage-collected: after a
+         * backlog was sent the partition looked full with nothing queued (2026-11-10). */
+        esp_spiffs_gc(LABEL, need + RESERVE);
+        esp_spiffs_info(LABEL, &total, &used);
+    }
     if (esp_spiffs_info(LABEL, &total, &used) != ESP_OK || used + need + RESERVE > total) {
         ESP_LOGW(TAG, "queue full (%u/%u KB used)", (unsigned)(used / 1024), (unsigned)(total / 1024));
         return ESP_ERR_NO_MEM;
@@ -186,6 +192,6 @@ esp_err_t onurb_spool_start(void)
     size_t total = 0, used = 0;
     esp_spiffs_info(LABEL, &total, &used);
     ESP_LOGI(TAG, "%d queued, %u/%u KB used", scan(NULL, 0), (unsigned)(used / 1024), (unsigned)(total / 1024));
-    xTaskCreatePinnedToCore(spool_task, "spool", 6144, NULL, 3, NULL, 0);
+    xTaskCreatePinnedToCore(spool_task, "spool", 8192, NULL, 3, NULL, 0);
     return ESP_OK;
 }

@@ -217,6 +217,13 @@ static void candidate_step(bool in_dwell)
     }
 }
 
+static volatile float s_motion_dps;     /* wrist motion, peak-hold with decay (power: wake from doze) */
+
+float onurb_imu_motion_dps(void)
+{
+    return s_motion_dps;
+}
+
 static void imu_task(void *arg)
 {
     qmi8658_data_t d;
@@ -233,6 +240,7 @@ static void imu_task(void *arg)
         }
         float pitch, roll;
         float dps = sqrtf(d.gyroX * d.gyroX + d.gyroY * d.gyroY + d.gyroZ * d.gyroZ);
+        s_motion_dps = dps > s_motion_dps * 0.85f ? dps : s_motion_dps * 0.85f;
         int64_t now_ms = (int64_t)xTaskGetTickCount() * portTICK_PERIOD_MS;
         tilt(&d, &pitch, &roll);
         s_strong_run = dps >= END_DPS ? s_strong_run + 1 : 0;

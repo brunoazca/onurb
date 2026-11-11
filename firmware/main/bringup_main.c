@@ -18,6 +18,7 @@
  */
 #include <inttypes.h>
 #include <math.h>
+#include "esp_pm.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include <stdlib.h>
@@ -341,6 +342,7 @@ typedef enum {
 } stop_mode_t;
 
 static int16_t *s_mono;                          /* the 90 s recording buffer (defined below) */
+static char s_rec_diag[48];                      /* last recording: audio vs wall-clock seconds */
 
 typedef struct {
     int seq;
@@ -361,6 +363,7 @@ typedef struct {
     size_t gesture_len;
     char gesture_detail[128];
     uint32_t thread;                             /* local id of its side stick (0 = none) */
+    int64_t created_us;
     onurb_turn_meta_t meta;                      /* thread in (reply_to) / out (id, state, heard) */
 } turn_job_t;
 
@@ -386,6 +389,10 @@ static struct {
     int64_t until_us;
 } s_action;
 static volatile bool s_inbox_busy;
+#define PROCESSING_LIT_S 12
+#define SCREEN_DETAIL_IDLE_S 60
+#define THREAD_HIST_CAP (ONURB_UI_THREAD_HIST_MAX + 1)
+static int64_t s_processing_lit_until_us;   /* screen stays on while waiting until then */
 static int64_t s_inbox_next_us;
 
 static void free_job(turn_job_t *job)
@@ -412,6 +419,7 @@ typedef struct {
     char tid[33];                                /* gateway thread id (turn id of the opening request) */
     char heard[ONURB_HEARD_CAP];
     char reply[320];
+    char *hist;                                  /* PSRAM, THREAD_HIST_CAP: earlier exchanges (ui.h format) */
     int64_t done_at;
 } thread_t;
 static thread_t s_threads[MAX_THREADS];
@@ -443,6 +451,7 @@ static void thread_remove(uint32_t id)
 {
     for (int i = 0; i < s_nthreads; i++) {
         if (s_threads[i].id == id) {
+            free(s_threads[i].hist);
             memmove(&s_threads[i], &s_threads[i + 1], (size_t)(s_nthreads - i - 1) * sizeof(thread_t));
             s_nthreads--;
             s_threads_dirty = true;
@@ -467,6 +476,7 @@ static thread_t *thread_new(uint32_t id)
     memmove(&s_threads[1], &s_threads[0], (size_t)s_nthreads * sizeof(thread_t));
     s_nthreads++;
     memset(&s_threads[0], 0, sizeof(thread_t));
+    s_threads[0].hist = heap_caps_calloc(1, THREAD_HIST_CAP, MALLOC_CAP_SPIRAM);
     s_threads[0].id = id;
     s_threads[0].state = TH_PROCESSING;
     s_threads_dirty = true;
@@ -487,6 +497,32 @@ static void thread_finish(thread_t *t, const onurb_turn_meta_t *m, const char *r
     s_threads_dirty = true;
 }
 
+/* Move the thread's current heard/reply into its history (oldest dropped when full). */
+static void thread_push_history(thread_t *t)
+{
+    if (t->hist == NULL || (t->heard[0] == '\0' && t->reply[0] == '\0')) {
+        return;
+    }
+    size_t add = strlen(t->heard) + strlen(t->reply) + 2;
+    size_t len = strlen(t->hist);
+    while (len > 0 && len + add >= THREAD_HIST_CAP) {
+        char *rs = strchr(t->hist, '\x1e');           /* drop the oldest exchange */
+        if (rs == NULL) {
+            len = 0;
+            t->hist[0] = '\0';
+            break;
+        }
+        memmove(t->hist, rs + 1, strlen(rs + 1) + 1);
+        len = strlen(t->hist);
+    }
+    if (len + add < THREAD_HIST_CAP) {
+        snprintf(t->hist + len, THREAD_HIST_CAP - len, "%s\x1f%s\x1e", t->heard, t->reply);
+    }
+    t->heard[0] = '\0';
+    t->reply[0] = '\0';
+    s_threads_dirty = true;
+}
+
 static void threads_tick(int64_t now)
 {
     for (int i = s_nthreads - 1; i >= 0; i--) {
@@ -503,7 +539,8 @@ static void threads_tick(int64_t now)
         };
         onurb_thread_t v[MAX_THREADS];
         for (int i = 0; i < s_nthreads; i++) {
-            v[i] = (onurb_thread_t){s_threads[i].id, map[s_threads[i].state], s_threads[i].heard, s_threads[i].reply};
+            v[i] = (onurb_thread_t){s_threads[i].id, map[s_threads[i].state], s_threads[i].heard, s_threads[i].reply,
+                                    s_threads[i].hist};
         }
         onurb_ui_set_threads(v, s_nthreads);
     }
@@ -621,6 +658,12 @@ static void start_turn(int frames, const char *edit_of)
         memmove(s_mono, s_mono + SEND_SKIP_FRAMES, (size_t)frames * sizeof(int16_t));
     }
     turn_job_t *job = NULL;
+    if (onurb_wifi_level() < 1) {                 /* just woke from doze: Wi-Fi ~1-2 s */
+        onurb_ui_set_status("Connecting...", ONURB_UI_COLOR_BUSY);
+        for (int i = 0; onurb_wifi_level() < 1 && i < 200; i++) {   /* <= 20 s: reconnects can take 5-10 s */
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
     if (onurb_wifi_level() >= 1 && jobs_pending() < MAX_JOBS) {
         job = calloc(1, sizeof(*job));
     }
@@ -631,12 +674,14 @@ static void start_turn(int frames, const char *edit_of)
         return;
     }
     job->seq = s_next_seq++;
+    job->created_us = esp_timer_get_time();
     job->frames = frames;
     if (edit_of) {
         strlcpy(job->edit_of, edit_of, sizeof(job->edit_of));
     }
     thread_t *th = s_reply_to ? thread_find(s_reply_to) : NULL;
     if (th) {                                    /* spoken answer inside an open thread */
+        thread_push_history(th);                 /* the question it answers stays visible above */
         strlcpy(job->meta.reply_to, th->tid, sizeof(job->meta.reply_to));
         th->state = TH_PROCESSING;
         s_threads_dirty = true;
@@ -647,6 +692,7 @@ static void start_turn(int frames, const char *edit_of)
         }
     }
     job->thread = th->id;
+    strlcpy(job->meta.rec, s_rec_diag, sizeof(job->meta.rec));
     s_reply_to = 0;
     s_last_job = job;
     s_uploading = true;
@@ -666,18 +712,32 @@ static void start_turn(int frames, const char *edit_of)
     }
     onurb_ui_set_state(ONURB_UI_PROCESSING, 0);
     s_ui_mode = UI_PROCESSING;
+    s_processing_lit_until_us = esp_timer_get_time() + (int64_t)PROCESSING_LIT_S * 1000000;
 }
 
-/* X tapped: cancel the newest request still processing. */
-static void cancel_newest(void)
+/* Cancel a request still processing: thread == 0 -> the newest one (the X on
+ * the main circle), else the one shown in that thread (X in its tab). */
+static void cancel_request(uint32_t thread)
 {
     turn_job_t *job = NULL;
     uint32_t thread_id = 0;
     taskENTER_CRITICAL(&s_job_mux);
     char *csv = NULL;
     size_t csv_len = 0;
-    if (s_njobs > 0 && !s_jobs[s_njobs - 1]->done) {
-        job = s_jobs[--s_njobs];
+    int idx = -1;
+    for (int i = s_njobs - 1; i >= 0; i--) {
+        if (!s_jobs[i]->done && (thread == 0 || s_jobs[i]->thread == thread)) {
+            idx = i;
+            break;
+        }
+        if (thread == 0) {
+            break;                               /* main X: only the newest */
+        }
+    }
+    if (idx >= 0) {
+        job = s_jobs[idx];
+        memmove(&s_jobs[idx], &s_jobs[idx + 1], (size_t)(s_njobs - idx - 1) * sizeof(s_jobs[0]));
+        s_njobs--;
         job->abandoned = true;                   /* the worker frees it */
         thread_id = job->thread;
         csv = job->gesture_csv;                  /* keep it for the "wrong gesture" tap */
@@ -774,9 +834,13 @@ static void present_next(void)
         notice(msg, ONURB_UI_COLOR_ERROR, 3000);
     } else if (job->reply == NULL) {             /* gateway heard nothing: no notice */
         ESP_LOGI(TAG, "request #%d: no speech - dismissed", job->seq);
+        if (job->gesture_csv) {                  /* gesture-started and dismissed: false trigger */
+            onurb_turn_post_gesture_feedback(job->gesture_csv, job->gesture_len, "wrong", job->gesture_detail);
+        }
     } else {
         ESP_LOGI(TAG, "request #%d reply: %s", job->seq, job->text);
-        onurb_haptic(ONURB_HAPTIC_REPLY);        /* light, distinct from rec start/stop */
+        /* a question / something waiting for the user buzzes stronger than a plain reply */
+        onurb_haptic(th && th->state == TH_OPEN ? ONURB_HAPTIC_NOTIFY : ONURB_HAPTIC_REPLY);
 #if ONURB_UI_HAS_REPLY && !ONURB_UI_HAS_THREADS
         onurb_ui_set_reply(job->text);           /* pushed on top of the history */
 #endif
@@ -893,13 +957,36 @@ static void pipeline_tick(void)
 {
     int64_t now = esp_timer_get_time();
 
+    /* A request whose worker never finished (no reply in 7 min, past every HTTP
+     * timeout) would block every later one and keep the watch "busy" forever. */
+    {
+        turn_job_t *stale = NULL;
+        taskENTER_CRITICAL(&s_job_mux);
+        if (s_njobs > 0 && !s_jobs[0]->done && s_jobs[0]->created_us &&
+            now - s_jobs[0]->created_us > 7LL * 60 * 1000000) {
+            stale = s_jobs[0];
+            memmove(&s_jobs[0], &s_jobs[1], (size_t)(--s_njobs) * sizeof(s_jobs[0]));
+            stale->abandoned = true;             /* its worker frees it if it ever returns */
+        }
+        taskEXIT_CRITICAL(&s_job_mux);
+        if (stale) {
+            ESP_LOGE(TAG, "request #%d stuck for 7 min - dropped", stale->seq);
+            thread_t *th = thread_find(stale->thread);
+            if (th) {
+                strlcpy(th->reply, "Sem resposta (tempo esgotado)", sizeof(th->reply));
+                th->state = TH_ERROR;
+                th->done_at = now;
+                s_threads_dirty = true;
+            }
+        }
+    }
     if (s_ui_mode != UI_REPLY) {
         present_next();
     }
     if (s_ui_mode == UI_PROCESSING) {
 #if ONURB_UI_HAS_CANCEL
         if (onurb_ui_cancel_taken()) {
-            cancel_newest();
+            cancel_request(0);
         }
 #endif
     } else if (s_ui_mode == UI_ACTION) {
@@ -927,6 +1014,19 @@ static void pipeline_tick(void)
         s_ui_mode = UI_IDLE;
     }
     threads_tick(now);
+#if ONURB_UI_HAS_THREAD_CANCEL
+    uint32_t cancel_th = onurb_ui_thread_cancel_taken();
+    if (cancel_th) {
+        thread_t *ct = thread_find(cancel_th);
+        if (ct && ct->state == TH_OPEN) {        /* "waiting for you": the user closes it */
+            ESP_LOGI(TAG, "thread %lu closed by the user (left unanswered)", (unsigned long)cancel_th);
+            thread_remove(cancel_th);
+        } else {
+            ESP_LOGI(TAG, "cancel in thread %lu", (unsigned long)cancel_th);
+            cancel_request(cancel_th);
+        }
+    }
+#endif
 #if ONURB_UI_HAS_THREADS
     uint32_t answer = onurb_ui_thread_reply_taken();
     if (answer && (s_ui_mode == UI_IDLE || s_ui_mode == UI_PROCESSING || s_ui_mode == UI_REPLY) &&
@@ -969,7 +1069,11 @@ static void pipeline_tick(void)
     } else if (s_ui_mode == UI_IDLE && pending == 0 && s_screen_held) {
         onurb_ui_set_state(ONURB_UI_IDLE, 0);
     }
-    bool busy = pending > 0 || s_ui_mode != UI_IDLE;   /* incl. a WhatsApp preview waiting */
+    /* Waiting for an answer keeps the screen on only for PROCESSING_LIT_S after the
+     * user asked (agent turns can take minutes; the stuck jobs at 19:00 held it lit
+     * for hours). The reply lights it again (UI_REPLY) with a buzz. */
+    bool waiting = pending > 0 || s_ui_mode == UI_PROCESSING;
+    bool busy = waiting ? now < s_processing_lit_until_us : s_ui_mode != UI_IDLE;   /* incl. a WhatsApp preview */
     if (busy != s_screen_held) {
         s_screen_held = busy;
         if (busy) {
@@ -1081,6 +1185,8 @@ static int record(stop_mode_t mode, int16_t **out)
     onurb_haptic(ONURB_HAPTIC_REC_START);        /* felt cue: the speaker may be off */
     play_tone(880, 60);                          /* start cue, before the mic is read */
     mic_flush(s_scratch, 40);                    /* short: don't cut the first word */
+    onurb_ui_rec_stop_taken();                   /* stale taps from before this recording */
+    onurb_ui_rec_cancel_taken();
     ESP_LOGI(TAG, "recording (%s), limit %.0f s...",
              mode == STOP_ON_RELEASE ? "hold" : mode == STOP_ON_MOTION ? "gesture" : "edit",
              (double)max_frames / SAMPLE_RATE);
@@ -1089,6 +1195,8 @@ static int record(stop_mode_t mode, int16_t **out)
     s_last_voiced = 0;
     static slot_stats_t st;
     memset(&st, 0, sizeof(st));
+    int64_t t_start = esp_timer_get_time();
+    int64_t worst_us = 0, t_prev = t_start;
     s_rec_frames = 0;                            /* rec_ui_task shows the timer from this */
     int last_voice = 0;                          /* frame count at the last voiced chunk */
     while (frames + FRAMES_PER_READ <= max_frames) {
@@ -1107,6 +1215,16 @@ static int record(stop_mode_t mode, int16_t **out)
             why = "released";
             break;
         }
+        if (onurb_ui_rec_cancel_taken()) {       /* X beside the red mic: discard */
+            ESP_LOGI(TAG, "recording discarded by the user");
+            rec_ui_stop();
+            onurb_haptic(ONURB_HAPTIC_REC_STOP);
+            return -1;
+        }
+        if (frames >= SAMPLE_RATE / 2 && onurb_ui_rec_stop_taken()) {   /* red mic tapped: send */
+            why = "tap";
+            break;
+        }
         if (mode != STOP_ON_RELEASE && frames >= MOTION_GRACE_FRAMES) {
             int end = mode == STOP_ON_MOTION ? onurb_imu_end_motion() : ONURB_IMU_END_NONE;
             if (end != ONURB_IMU_END_NONE) {
@@ -1120,6 +1238,11 @@ static int record(stop_mode_t mode, int16_t **out)
         }
         int16_t *chunk = frames < HEAD_FRAMES ? s_head + (size_t)frames * TDM_SLOTS : s_scratch;
         esp_codec_dev_read(s_mic, chunk, FRAMES_PER_READ * TDM_SLOTS * sizeof(int16_t));
+        int64_t t_now = esp_timer_get_time();
+        if (t_now - t_prev > worst_us) {
+            worst_us = t_now - t_prev;                /* longest gap between reads */
+        }
+        t_prev = t_now;
         if (frames >= PICK_SKIP_FRAMES && chunk_has_voice(chunk)) {
             voiced++;
             last_voice = frames + FRAMES_PER_READ;
@@ -1145,6 +1268,9 @@ static int record(stop_mode_t mode, int16_t **out)
         head_to_mono(mono, frames, slot);
     }
     s_last_voiced = voiced;
+    snprintf(s_rec_diag, sizeof(s_rec_diag), "audio=%.2f;wall=%.2f;gap_ms=%d", (double)frames / SAMPLE_RATE,
+             (esp_timer_get_time() - t_start) / 1e6, (int)(worst_us / 1000));
+    ESP_LOGI(TAG, "%s", s_rec_diag);
     ESP_LOGI(TAG, "stopped (%s) after %.1f s, %.2f s voiced, %s", why, (double)frames / SAMPLE_RATE,
              voiced / 100.0, SLOT_NAMES[slot]);
     play_tone(660, 120);                         /* stop cue, after capture */
@@ -1181,6 +1307,8 @@ static void record_and_queue(stop_mode_t mode, const char *edit_of)
     }
 }
 
+static void power_wake(const char *why);
+
 static void gesture_turn(void)
 {
     bool accepted;
@@ -1191,6 +1319,7 @@ static void gesture_turn(void)
         return;
     }
     if (accepted) {                              /* also while earlier requests process / a reply shows */
+        power_wake("gesture");
         onurb_ota_set_busy(true);                /* a background update pauses for the turn */
         onurb_screen_hold();
         record_and_queue(STOP_ON_MOTION, NULL);
@@ -1203,7 +1332,10 @@ static void gesture_turn(void)
         vTaskDelay(pdMS_TO_TICKS(20));           /* post-entry second still sampling */
     }
     if (onurb_imu_gesture_csv(&csv, &len)) {
-        onurb_turn_post_gesture_feedback(csv, len, accepted ? "accepted" : "rejected", detail);
+        /* accepted but the recording was dropped (nobody spoke): a false trigger -> negative
+         * example for training (Bruno, 2026-11-10) */
+        onurb_turn_post_gesture_feedback(csv, len, !accepted ? "rejected" : s_last_job ? "accepted" : "wrong",
+                                         detail);
         turn_job_t *job = accepted ? s_last_job : NULL;
         char *copy = job ? malloc(len) : NULL;
         if (copy) {                              /* kept with the request: cancel -> "wrong gesture" tap */
@@ -1259,8 +1391,91 @@ static void motion_capture(void)
     vTaskDelay(pdMS_TO_TICKS(1000));
 }
 
+/* ---- Power (Bruno, 2026-11-10) ---------------------------------------------
+ * 1. Dynamic frequency scaling (esp_pm): 80-240 MHz, drivers raise it when busy.
+ * 2. Doze: after DOZE_AFTER_S with the screen off and nothing going on (and not
+ *    on USB), the Wi-Fi radio goes off. Wrist motion, the button, a gesture or
+ *    anything holding the screen wakes it (Wi-Fi back in ~1-2 s; a recording
+ *    started meanwhile uploads when it's back). Every DOZE_PEEK_S it wakes
+ *    briefly anyway, to fetch background results and report the battery.
+ * Battery/doze telemetry rides on the update check (gateway battery.csv). */
+#define DOZE_AFTER_S   120
+#define DOZE_PEEK_S    (10 * 60)
+#define PEEK_LEN_S     45
+#define WAKE_DPS       200.0f                   /* a quick raise (gestures peak 300-800 dps); not arm swing */
+static int64_t s_active_us;                      /* last activity */
+static int64_t s_doze_since_us;
+static bool s_peeking;
+
+static void power_wake(const char *why)
+{
+    s_active_us = esp_timer_get_time();
+    s_peeking = false;
+    if (onurb_wifi_dozing()) {
+        ESP_LOGI(TAG, "wake (%s) after %lld s of doze", why, (long long)((s_active_us - s_doze_since_us) / 1000000));
+        onurb_wifi_doze(false);
+        onurb_ota_check_soon();
+    }
+}
+
+static void power_tick(void)
+{
+    int64_t now = esp_timer_get_time();
+    onurb_pmu_status_t st = {0};
+    bool usb = onurb_pmu_get_status(&st) == ESP_OK && st.usb_in;
+    bool busy = s_screen_held || onurb_screen_is_on() || jobs_pending() > 0 || s_uploading || s_ui_mode != UI_IDLE ||
+                s_action.json != NULL || onurb_spool_busy() || s_inbox_busy;
+    if (busy || usb) {
+        s_active_us = now;
+    }
+    if (onurb_wifi_dozing()) {
+        /* No wake on plain wrist motion: on the arm it fired all the time and every
+         * wake meant a reconnect plus 2 more minutes of radio. A gesture or a button
+         * turn wakes it (the reconnect overlaps the recording); queued offline
+         * recordings go out on the next peek or turn. */
+        if (busy) {
+            power_wake("activity");
+        } else if (now - s_doze_since_us >= (int64_t)DOZE_PEEK_S * 1000000) {
+            ESP_LOGI(TAG, "doze peek: inbox");   /* update checks stay hourly (onurb_ota_tick) */
+            onurb_wifi_doze(false);
+            s_inbox_next_us = 0;
+            s_peeking = true;
+            s_active_us = now - (int64_t)(DOZE_AFTER_S - PEEK_LEN_S) * 1000000;   /* back to doze after the peek */
+        }
+        return;
+    }
+    if (now - s_active_us >= (int64_t)DOZE_AFTER_S * 1000000 && !onurb_ota_busy_downloading()) {
+        s_doze_since_us = now;
+        onurb_wifi_doze(true);
+    }
+}
+
+static void power_report(void)
+{
+    onurb_pmu_status_t st;
+    static char buf[160];      /* main task: keep big buffers off its stack */
+    if (onurb_pmu_get_status(&st) == ESP_OK) {
+        static char scr[64];
+        onurb_screen_stats(scr, sizeof(scr));
+        /* internal RAM: task stacks and Wi-Fi need it; ran out on 2026-11-11 */
+        unsigned iram = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024;
+        unsigned iblk = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024;
+        ESP_LOGD(TAG, "internal RAM free %u KB, largest block %u KB", iram, iblk);
+        snprintf(buf, sizeof(buf), "batt=%d;mv=%d;chg=%d;usb=%d;jobs=%d;spool=%d;%s;iram_kb=%u;iblk_kb=%u",
+                 st.battery ? st.percent : -1, st.millivolts, st.charging, st.usb_in, jobs_pending(),
+                 onurb_spool_count(), scr, iram, iblk);
+        onurb_ota_set_power_status(buf);
+    }
+}
+
 void app_main(void)
 {
+#if CONFIG_PM_ENABLE
+    esp_pm_config_t pm = {.max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ, .min_freq_mhz = 80,
+                          .light_sleep_enable = false};
+    ESP_LOGI(TAG, "power: DFS %d-%d MHz (%s)", pm.min_freq_mhz, pm.max_freq_mhz,
+             esp_err_to_name(esp_pm_configure(&pm)));
+#endif
     log_system_info();
     onurb_ota_boot_info();
     ESP_ERROR_CHECK(bsp_i2c_init());
@@ -1316,9 +1531,19 @@ void app_main(void)
             gesture_turn();
             pipeline_tick();
             onurb_ota_tick();
+            /* Main view (the circle): the usual short timeout. Threads, previews, the Wi-Fi
+             * picker: 1 min, restarted by any touch (Bruno, 2026-11-11). */
+            onurb_screen_set_idle_s(onurb_ui_main_view() ? CONFIG_ONURB_SCREEN_IDLE_S : SCREEN_DETAIL_IDLE_S);
             onurb_screen_tick();
+            static bool screen_was_on;
+            if (onurb_screen_is_on() && !screen_was_on) {
+                onurb_ota_check_soon();          /* opened: check for an update (rate-limited) */
+            }
+            screen_was_on = onurb_screen_is_on();
+            power_tick();
             if (++idle_ticks % 200 == 0) {       /* screen every 2 s */
                 ui_refresh();
+                power_report();
             }
             if (idle_ticks >= 3000) {            /* logs every 30 s */
                 idle_ticks = 0;
@@ -1331,6 +1556,7 @@ void app_main(void)
         if (!button_pressed()) {
             continue;
         }
+        power_wake("button");
         onurb_ota_set_busy(true);                /* a background update pauses for the turn */
         onurb_screen_hold();                     /* on for the recording / capture */
         vTaskDelay(pdMS_TO_TICKS(200));

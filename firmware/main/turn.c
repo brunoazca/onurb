@@ -13,6 +13,7 @@
 
 #include "imu.h"
 #include "turn.h"
+#include "api.h"
 #include "wav.h"
 
 static const char *TAG = "onurb_turn";
@@ -86,7 +87,7 @@ static esp_err_t turn_post(const char *path, const int16_t *pcm, FILE *src, size
                            uint8_t **reply, size_t *reply_len, int *http_status, onurb_turn_meta_t *meta)
 {
     reply_text_t rt = {text, text_cap, action_out, meta};
-    const char *base = CONFIG_ONURB_API_BASE_URL;
+    const char *base = onurb_api_base();
     char url[160];
     char turn_id[33];
     uint8_t header[WAV_HEADER_SIZE];
@@ -144,6 +145,9 @@ static esp_err_t turn_post(const char *path, const int16_t *pcm, FILE *src, size
     if (meta && meta->reply_to[0]) {
         esp_http_client_set_header(client, "X-Onurb-Thread", meta->reply_to);
     }
+    if (meta && meta->rec[0]) {
+        esp_http_client_set_header(client, "X-Onurb-Rec", meta->rec);
+    }
     if (queued_at != LIVE) {
         char at[24];
         snprintf(at, sizeof(at), "%lld", (long long)queued_at);
@@ -155,11 +159,7 @@ static esp_err_t turn_post(const char *path, const int16_t *pcm, FILE *src, size
     onurb_imu_get_tilt(&pitch, &roll);
     snprintf(tilt, sizeof(tilt), "pitch=%.0f;roll=%.0f", pitch, roll);
     esp_http_client_set_header(client, "X-Onurb-Tilt", tilt);
-    if (strlen(CONFIG_ONURB_API_TOKEN) > 0) {
-        char auth[128];
-        snprintf(auth, sizeof(auth), "Bearer %s", CONFIG_ONURB_API_TOKEN);
-        esp_http_client_set_header(client, "Authorization", auth);
-    }
+    onurb_api_headers(client, base);
 
     phase(on_phase, ONURB_TURN_UPLOADING);
     /* Modem sleep (wifi.c default) throttles a burst upload; off for the upload only. */
@@ -269,8 +269,14 @@ esp_err_t onurb_turn_send(const int16_t *pcm, size_t samples, uint32_t sample_ra
                           char *reply_text, size_t text_cap, char action_id[ONURB_ACTION_ID_LEN],
                           uint8_t **reply, size_t *reply_len, int *http_status, onurb_turn_meta_t *meta)
 {
-    return turn_post("/v1/turns", pcm, NULL, samples, sample_rate, on_phase, LIVE, turn_id, reply_text, text_cap,
-                     action_id, reply, reply_len, http_status, meta);
+    const char *base = onurb_api_base();
+    esp_err_t err = turn_post("/v1/turns", pcm, NULL, samples, sample_rate, on_phase, LIVE, turn_id, reply_text,
+                              text_cap, action_id, reply, reply_len, http_status, meta);
+    if (err != ESP_OK && *http_status == 0 && onurb_api_failed(base)) {   /* away from home / Mac off */
+        err = turn_post("/v1/turns", pcm, NULL, samples, sample_rate, on_phase, LIVE, turn_id, reply_text,
+                        text_cap, action_id, reply, reply_len, http_status, meta);
+    }
+    return err;
 }
 
 esp_err_t onurb_turn_send_queued_file(FILE *src, size_t samples, uint32_t sample_rate,
@@ -299,7 +305,8 @@ esp_err_t onurb_http_get(const char *path, size_t max_len, uint8_t **body, size_
     if (reply_text && text_cap) {
         reply_text[0] = 0;
     }
-    snprintf(url, sizeof(url), "%s%s", CONFIG_ONURB_API_BASE_URL, path);
+    const char *base = onurb_api_base();
+    snprintf(url, sizeof(url), "%s%s", base, path);
     esp_http_client_config_t cfg = {
         .url = url,
         .timeout_ms = 15000,
@@ -312,11 +319,7 @@ esp_err_t onurb_http_get(const char *path, size_t max_len, uint8_t **body, size_
     if (c == NULL) {
         return ESP_ERR_NO_MEM;
     }
-    if (strlen(CONFIG_ONURB_API_TOKEN) > 0) {
-        char auth[128];
-        snprintf(auth, sizeof(auth), "Bearer %s", CONFIG_ONURB_API_TOKEN);
-        esp_http_client_set_header(c, "Authorization", auth);
-    }
+    onurb_api_headers(c, base);
     esp_err_t err = esp_http_client_open(c, 0);
     if (err == ESP_OK) {
         int64_t n = esp_http_client_fetch_headers(c);
@@ -343,6 +346,9 @@ esp_err_t onurb_http_get(const char *path, size_t max_len, uint8_t **body, size_
             err = ESP_FAIL;
         }
     }
+    if (err != ESP_OK && *http_status == 0) {
+        onurb_api_failed(base);                  /* next poll tries the other gateway */
+    }
     esp_http_client_close(c);
     esp_http_client_cleanup(c);
     return err;
@@ -365,7 +371,8 @@ static esp_err_t post_csv(const char *path, const char *csv, size_t len,
 {
     char url[160];
 
-    snprintf(url, sizeof(url), "%s%s", CONFIG_ONURB_API_BASE_URL, path);
+    const char *base = onurb_api_base();
+    snprintf(url, sizeof(url), "%s%s", base, path);
     esp_http_client_config_t cfg = {
         .url = url,
         .method = HTTP_METHOD_POST,
@@ -381,11 +388,7 @@ static esp_err_t post_csv(const char *path, const char *csv, size_t len,
     if (h2) {
         esp_http_client_set_header(client, h2, v2);
     }
-    if (strlen(CONFIG_ONURB_API_TOKEN) > 0) {
-        char auth[128];
-        snprintf(auth, sizeof(auth), "Bearer %s", CONFIG_ONURB_API_TOKEN);
-        esp_http_client_set_header(client, "Authorization", auth);
-    }
+    onurb_api_headers(client, base);
     esp_http_client_set_post_field(client, csv, len);
     esp_err_t err = esp_http_client_perform(client);
     int status = esp_http_client_get_status_code(client);

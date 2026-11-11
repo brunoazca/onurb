@@ -109,11 +109,27 @@ typedef struct {
     onurb_thread_state_t state;
     const char *heard;
     const char *reply;
+    /* Earlier exchanges of this thread, oldest first, shown above heard/reply:
+     * "heard\x1freply\x1e" per exchange (NULL/"" = none). */
+    const char *hist;
 } onurb_thread_t;
+#define ONURB_UI_THREAD_HIST_MAX 2047
 void onurb_ui_set_threads(const onurb_thread_t *t, int n);
 /* Id of the thread whose mic was tapped (latched; read clears), 0 = none.
  * While that thread stays open, set_state(RECORDING) keeps the thread view
  * (its mic turns red) instead of switching to the main view. */
 uint32_t onurb_ui_thread_reply_taken(void);
+/* Thread view X (shown only while the open thread is PROCESSING): id of the
+ * thread whose X was tapped (latched; read clears), 0 = none. The hint then
+ * reads "Cancelling..." until the thread leaves PROCESSING or the list. */
+#define ONURB_UI_HAS_THREAD_CANCEL 1
+uint32_t onurb_ui_thread_cancel_taken(void);
 /* Thread open right now, 0 = main view. */
 uint32_t onurb_ui_thread_view(void);
+/* While answering a thread by voice: the red mic was tapped (stop and send) or
+ * the X beside it (discard, back to "Tap to answer"). Latched; read clears. */
+bool onurb_ui_rec_stop_taken(void);
+bool onurb_ui_rec_cancel_taken(void);
+/* Main view (the circle) vs anything else (a thread, the WhatsApp preview,
+ * the Wi-Fi picker): the screen stays on longer outside the main view. */
+bool onurb_ui_main_view(void);

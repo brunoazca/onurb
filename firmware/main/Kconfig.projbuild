@@ -16,6 +16,20 @@ menu "Onurb"
         help
             Onurb gateway (docs/AGENT.md). Placeholder in git; set locally.
 
+    config ONURB_API_REMOTE_URL
+        string "Remote gateway URL (server, HTTPS; empty = none)"
+        default ""
+        help
+            docs/SERVER.md. Used when the local gateway can't be reached. Set locally.
+
+    config ONURB_CF_ACCESS_ID
+        string "Cloudflare Access service token: client id"
+        default ""
+
+    config ONURB_CF_ACCESS_SECRET
+        string "Cloudflare Access service token: client secret"
+        default ""
+
     config ONURB_API_TOKEN
         string "Gateway bearer token (empty = none)"
         default ""
@@ -67,7 +81,7 @@ menu "Onurb"
     config ONURB_OTA_CHECK_MIN
         int "Minutes between Wi-Fi update checks"
         range 1 1440
-        default 5
+        default 60
         help
             The watch also checks once right after boot. Updates come from
             ONURB_API_BASE_URL/v1/firmware (served by the gateway).

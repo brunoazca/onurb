@@ -39,3 +39,6 @@ void onurb_imu_get_tilt(float *pitch, float *roll);
  * (arm lowered) or a strong flick (>= 250 dps for 0.2 s). 0 = keep going. */
 enum { ONURB_IMU_END_NONE = 0, ONURB_IMU_END_LEFT_MOUTH, ONURB_IMU_END_FLICK };
 int onurb_imu_end_motion(void);
+
+/* Current wrist rotation (deg/s, peak-held ~0.3 s): wakes the watch from doze. */
+float onurb_imu_motion_dps(void);

@@ -1027,6 +1027,8 @@ static void wifi_icon_cb(lv_event_t *e)
  * sends on release is ignored by the cancel X, the mic and the Wi-Fi icon. */
 #define TH_MAX         ONURB_UI_MAX_THREADS
 #define TH_TEXT        (ONURB_UI_THREAD_TEXT_MAX + 1)
+#define TH_HIST        (ONURB_UI_THREAD_HIST_MAX + 1)
+#define TH_X           56   /* small X beside the mic */
 #define RAIL_X         14
 #define RAIL_DOT       10
 #define RAIL_DASH_W    18
@@ -1049,6 +1051,7 @@ typedef struct {
     onurb_thread_state_t state;
     char *heard; /* TH_TEXT bytes each, in PSRAM */
     char *reply;
+    char *hist;  /* TH_HIST bytes, PSRAM: earlier exchanges ("heard\x1freply\x1e"...) */
 } th_item_t;
 
 static th_item_t s_th[TH_MAX];
@@ -1067,6 +1070,11 @@ static lv_obj_t *s_thv_head;
 static lv_obj_t *s_thv_body;
 static lv_obj_t *s_thv_mic;
 static lv_obj_t *s_thv_mic_hint;
+static lv_obj_t *s_thv_cancel;   /* X while PROCESSING */
+static lv_obj_t *s_thv_x;        /* small X beside the mic: close the thread / discard the recording */
+static volatile bool s_rec_stop, s_rec_cancel;
+static volatile uint32_t s_th_cancel_taken;
+static uint32_t s_th_cancel_sent; /* tapped, waiting for the thread to go */
 
 static lv_point_t s_sw_start;
 static bool s_sw_at_top, s_sw_at_bottom;
@@ -1126,6 +1134,10 @@ static uint32_t th_hash(const th_item_t *t)
     for (const char *p = t->reply; *p; p++) {
         h = (h ^ (uint8_t)*p) * 16777619u;
     }
+    h = (h ^ 0xFE) * 16777619u;
+    for (const char *p = t->hist; *p; p++) {
+        h = (h ^ (uint8_t)*p) * 16777619u;
+    }
     return h;
 }
 
@@ -1148,12 +1160,66 @@ static void rail_update(void)
     lv_obj_move_foreground(s_rail);
 }
 
+/* Buttons under the thread body:
+ *   OPEN            yellow mic (tap = answer) + small X (close the thread)
+ *   OPEN, recording red mic (tap = stop and send) + small X (discard, back to OPEN)
+ *   PROCESSING      big X (cancel the request) */
+static void thv_controls(const th_item_t *t)
+{
+    bool open = t->state == ONURB_THREAD_OPEN;
+    bool rec = open && s_mic_recording && s_mic_rec_id == t->id;
+    bool cancellable = t->state == ONURB_THREAD_PROCESSING;
+
+    lv_obj_set_hidden(s_thv_mic, !open);
+    lv_obj_set_hidden(s_thv_x, !open);
+    lv_obj_set_hidden(s_thv_cancel, !cancellable);
+    lv_obj_set_hidden(s_thv_mic_hint, !open && !cancellable);
+    if (open) {
+        lv_obj_set_style_bg_color(s_thv_mic, lv_color_hex(rec ? COLOR_TH_ERR : COLOR_TH_OPEN), 0);
+        lv_label_set_text(s_thv_mic_hint, rec ? "Listening... tap to send" : "Tap to answer");
+    } else if (cancellable) {
+        lv_label_set_text(s_thv_mic_hint, s_th_cancel_sent == t->id ? "Cancelling..." : "Tap to cancel");
+    }
+}
+
 static void mic_style(void)
 {
-    bool rec = s_mic_recording && s_mic_rec_id == s_view_id;
+    int i = th_find(s_view_id);
 
-    lv_obj_set_style_bg_color(s_thv_mic, lv_color_hex(rec ? COLOR_TH_ERR : COLOR_TH_OPEN), 0);
-    lv_label_set_text(s_thv_mic_hint, rec ? "Listening..." : "Tap to answer");
+    if (i >= 0) {
+        thv_controls(&s_th[i]);
+    }
+}
+
+static lv_obj_t *th_bubble_heard(const char *text)
+{
+    lv_obj_t *b = make_box(s_thv_body);
+    lv_obj_set_size(b, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_max_width(b, TH_BUBBLE_MAX, 0);
+    lv_obj_set_style_radius(b, 16, 0);
+    lv_obj_set_style_pad_hor(b, 14, 0);
+    lv_obj_set_style_pad_ver(b, 9, 0);
+    lv_obj_set_style_bg_color(b, lv_color_hex(COLOR_TH_HEARD), 0);
+    lv_obj_set_align(b, LV_ALIGN_TOP_RIGHT);
+    lv_obj_t *l = lv_label_create(b);
+    lv_obj_set_width(l, LV_SIZE_CONTENT);
+    lv_obj_set_style_max_width(l, TH_BUBBLE_MAX - 28, 0);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_style_text_font(l, &onurb_font_reply_20, 0);
+    lv_obj_set_style_text_color(l, lv_color_hex(text ? 0xD8D8D8 : 0x8A8A8A), 0);
+    lv_label_set_text(l, text ? text : "...");   /* NULL: sent, transcript not back yet */
+    return b;
+}
+
+static void th_reply_label(const char *text, bool latest)
+{
+    lv_obj_t *l = lv_label_create(s_thv_body);
+    lv_obj_set_width(l, TH_BODY_W);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_style_text_font(l, latest && strlen(text) <= REPLY_BIG_CHARS ? &onurb_font_reply_26
+                                                                           : &onurb_font_reply_20, 0);
+    lv_obj_set_style_text_color(l, lv_color_hex(latest ? 0xFFFFFF : 0xBDBDBD), 0);
+    lv_label_set_text(l, text);
 }
 
 static void thv_render(const th_item_t *t)
@@ -1174,6 +1240,10 @@ static void thv_render(const th_item_t *t)
     }
     bool same = t->id == s_th_shown_id;
     int32_t keep_y = same ? lv_obj_get_scroll_y(s_thv_body) : 0;
+    static uint32_t shown_text_len;            /* only a state change keeps the reading position */
+    uint32_t text_len = (uint32_t)(strlen(t->heard) + strlen(t->reply) + strlen(t->hist));
+    bool changed_text = !same || text_len != shown_text_len;
+    shown_text_len = text_len;
     s_th_shown_id = t->id;
     s_th_shown_hash = h;
 
@@ -1181,41 +1251,54 @@ static void thv_render(const th_item_t *t)
     lv_obj_set_style_text_color(s_thv_head, lv_color_hex(busy ? 0x9E9E9E : th_color(t->state)), 0);
     lv_obj_set_hidden(s_thv_spin, !busy);
 
-    lv_obj_set_height(s_thv_body, BSP_LCD_V_RES - TH_BODY_Y - (open ? TH_MIC + 64 : 36));
+    lv_obj_set_height(s_thv_body, BSP_LCD_V_RES - TH_BODY_Y -
+                                   (open || t->state == ONURB_THREAD_PROCESSING ? TH_MIC + 64 : 36));
     lv_obj_clean(s_thv_body);
+    /* The whole exchange, oldest first: earlier turns (dimmer), then the latest. */
+    static char seg[TH_TEXT];
+    lv_obj_t *last_heard = NULL;
+    for (const char *p = t->hist; *p;) {
+        const char *us = strchr(p, '\x1f'), *rs = strchr(p, '\x1e');
+        if (rs == NULL) {
+            break;
+        }
+        const char *hend = us && us < rs ? us : rs;
+        size_t n = (size_t)(hend - p) < sizeof(seg) - 1 ? (size_t)(hend - p) : sizeof(seg) - 1;
+        memcpy(seg, p, n);
+        seg[n] = '\0';
+        if (seg[0]) {
+            last_heard = th_bubble_heard(seg);
+        }
+        if (us && us < rs) {
+            n = (size_t)(rs - us - 1) < sizeof(seg) - 1 ? (size_t)(rs - us - 1) : sizeof(seg) - 1;
+            memcpy(seg, us + 1, n);
+            seg[n] = '\0';
+            if (seg[0]) {
+                th_reply_label(seg, false);
+            }
+        }
+        p = rs + 1;
+    }
     if (t->heard[0] != '\0') {
-        lv_obj_t *b = make_box(s_thv_body);
-        lv_obj_set_size(b, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-        lv_obj_set_style_max_width(b, TH_BUBBLE_MAX, 0);
-        lv_obj_set_style_radius(b, 16, 0);
-        lv_obj_set_style_pad_hor(b, 14, 0);
-        lv_obj_set_style_pad_ver(b, 9, 0);
-        lv_obj_set_style_bg_color(b, lv_color_hex(COLOR_TH_HEARD), 0);
-        lv_obj_set_align(b, LV_ALIGN_TOP_RIGHT);
-        lv_obj_t *l = lv_label_create(b);
-        lv_obj_set_width(l, LV_SIZE_CONTENT);
-        lv_obj_set_style_max_width(l, TH_BUBBLE_MAX - 28, 0);
-        lv_label_set_long_mode(l, LV_LABEL_LONG_MODE_WRAP);
-        lv_obj_set_style_text_font(l, &onurb_font_reply_20, 0);
-        lv_obj_set_style_text_color(l, lv_color_hex(0xD8D8D8), 0);
-        lv_label_set_text(l, t->heard);
+        last_heard = th_bubble_heard(t->heard);
+    } else if (t->hist[0] != '\0' && busy) {
+        last_heard = th_bubble_heard(NULL);   /* the answer just sent: "..." until its transcript */
     }
     if (t->reply[0] != '\0') {
-        lv_obj_t *l = lv_label_create(s_thv_body);
-        lv_obj_set_width(l, TH_BODY_W);
-        lv_label_set_long_mode(l, LV_LABEL_LONG_MODE_WRAP);
-        lv_obj_set_style_text_font(l, strlen(t->reply) <= REPLY_BIG_CHARS ? &onurb_font_reply_26
-                                                                        : &onurb_font_reply_20, 0);
-        lv_obj_set_style_text_color(l, lv_color_white(), 0);
-        lv_label_set_text(l, t->reply);
+        th_reply_label(t->reply, true);
     }
-    lv_obj_set_hidden(s_thv_mic, !open);
-    lv_obj_set_hidden(s_thv_mic_hint, !open);
-    if (open) {
-        mic_style();
-    }
+    thv_controls(t);
     lv_obj_update_layout(s_thv_body);
-    lv_obj_scroll_to_y(s_thv_body, keep_y, LV_ANIM_OFF);
+    if (same && keep_y >= 0 && !changed_text) {
+        lv_obj_scroll_to_y(s_thv_body, keep_y, LV_ANIM_OFF);
+    } else {
+        /* New content: show the latest exchange, from its question if it doesn't fit. */
+        lv_obj_scroll_to_y(s_thv_body, lv_obj_get_scroll_y(s_thv_body) + lv_obj_get_scroll_bottom(s_thv_body),
+                           LV_ANIM_OFF);
+        if (last_heard) {
+            lv_obj_scroll_to_view(last_heard, LV_ANIM_OFF);
+        }
+    }
 }
 
 static void thv_slide_cb(void *obj, int32_t v)
@@ -1269,6 +1352,7 @@ static void indev_cb(lv_event_t *e)
 
     lv_indev_get_point(indev, &p);
     if (code == LV_EVENT_PRESSED) {
+        onurb_screen_touch();                 /* any touch restarts the screen-off timer */
         s_swiped = false;
         s_sw_start = p;
         s_sw_at_top = s_view_id == 0 || lv_obj_get_scroll_top(s_thv_body) <= 0;
@@ -1298,8 +1382,38 @@ static void mic_cb(lv_event_t *e)
     if (s_swiped || i < 0 || s_th[i].state != ONURB_THREAD_OPEN) {
         return;
     }
+    if (s_mic_recording && s_mic_rec_id == s_view_id) {
+        s_rec_stop = true;                    /* red mic: stop and send */
+        return;
+    }
     s_mic_taken = s_view_id;
     s_mic_rec_id = s_view_id;
+}
+
+static void th_x_cb(lv_event_t *e)
+{
+    int i = th_find(s_view_id);
+
+    if (s_swiped || i < 0 || s_th[i].state != ONURB_THREAD_OPEN) {
+        return;
+    }
+    if (s_mic_recording && s_mic_rec_id == s_view_id) {
+        s_rec_cancel = true;                  /* discard the answer, back to "Tap to answer" */
+        return;
+    }
+    s_th_cancel_taken = s_view_id;            /* close the thread (the main task removes it) */
+}
+
+static void th_cancel_cb(lv_event_t *e)
+{
+    int i = th_find(s_view_id);
+
+    if (s_swiped || i < 0 || s_th[i].state != ONURB_THREAD_PROCESSING) {
+        return;
+    }
+    s_th_cancel_taken = s_view_id;
+    s_th_cancel_sent = s_view_id;
+    lv_label_set_text(s_thv_mic_hint, "Cancelling...");
 }
 
 static void make_mic_glyph(lv_obj_t *btn)
@@ -1339,7 +1453,8 @@ static void make_threads(lv_obj_t *scr)
     for (int i = 0; i < TH_MAX; i++) {
         s_th[i].heard = heap_caps_calloc(1, TH_TEXT, MALLOC_CAP_SPIRAM);
         s_th[i].reply = heap_caps_calloc(1, TH_TEXT, MALLOC_CAP_SPIRAM);
-        if (s_th[i].heard == NULL || s_th[i].reply == NULL) {
+        s_th[i].hist = heap_caps_calloc(1, TH_HIST, MALLOC_CAP_SPIRAM);
+        if (s_th[i].heard == NULL || s_th[i].reply == NULL || s_th[i].hist == NULL) {
             ESP_LOGE(TAG, "thread buffers: out of PSRAM");
         }
     }
@@ -1395,6 +1510,38 @@ static void make_threads(lv_obj_t *scr)
     lv_obj_align(s_thv_mic, LV_ALIGN_BOTTOM_MID, 0, -46);
     lv_obj_add_event_cb(s_thv_mic, mic_cb, LV_EVENT_CLICKED, NULL);
     make_mic_glyph(s_thv_mic);
+
+    s_thv_cancel = lv_button_create(s_thv);
+    lv_obj_set_size(s_thv_cancel, TH_MIC, TH_MIC);
+    lv_obj_set_style_radius(s_thv_cancel, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_shadow_width(s_thv_cancel, 0, 0);
+    lv_obj_set_style_bg_color(s_thv_cancel, lv_color_hex(0x2E2E2E), 0);
+    lv_obj_set_style_bg_color(s_thv_cancel, lv_color_hex(0xB3302A), LV_STATE_PRESSED);
+    lv_obj_set_ext_click_area(s_thv_cancel, 10);
+    lv_obj_align(s_thv_cancel, LV_ALIGN_BOTTOM_MID, 0, -46);
+    lv_obj_add_event_cb(s_thv_cancel, th_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *x = lv_label_create(s_thv_cancel);
+    lv_obj_set_style_text_font(x, &lv_font_montserrat_40, 0);
+    lv_obj_set_style_text_color(x, lv_color_white(), 0);
+    lv_label_set_text(x, LV_SYMBOL_CLOSE);
+    lv_obj_center(x);
+    lv_obj_set_hidden(s_thv_cancel, true);
+
+    s_thv_x = lv_button_create(s_thv);
+    lv_obj_set_size(s_thv_x, TH_X, TH_X);
+    lv_obj_set_style_radius(s_thv_x, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_shadow_width(s_thv_x, 0, 0);
+    lv_obj_set_style_bg_color(s_thv_x, lv_color_hex(0x2E2E2E), 0);
+    lv_obj_set_style_bg_color(s_thv_x, lv_color_hex(0xB3302A), LV_STATE_PRESSED);
+    lv_obj_set_ext_click_area(s_thv_x, 8);
+    lv_obj_align(s_thv_x, LV_ALIGN_BOTTOM_MID, TH_MIC / 2 + 22 + TH_X / 2, -46 - (TH_MIC - TH_X) / 2);
+    lv_obj_add_event_cb(s_thv_x, th_x_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *sx = lv_label_create(s_thv_x);
+    lv_obj_set_style_text_font(sx, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(sx, lv_color_white(), 0);
+    lv_label_set_text(sx, LV_SYMBOL_CLOSE);
+    lv_obj_center(sx);
+    lv_obj_set_hidden(s_thv_x, true);
 
     s_thv_mic_hint = lv_label_create(s_thv);
     lv_obj_set_style_text_font(s_thv_mic_hint, &lv_font_montserrat_14, 0);
@@ -1459,9 +1606,16 @@ void onurb_ui_set_threads(const onurb_thread_t *t, int n)
         s_th[k].state = t[i].state;
         copy_utf8(s_th[k].heard, t[i].heard, TH_TEXT);
         copy_utf8(s_th[k].reply, t[i].reply, TH_TEXT);
+        copy_utf8(s_th[k].hist, t[i].hist, TH_HIST);
         k++;
     }
     s_th_n = k;
+    if (s_th_cancel_sent != 0) {
+        int c = th_find(s_th_cancel_sent);
+        if (c < 0 || s_th[c].state != ONURB_THREAD_PROCESSING) {
+            s_th_cancel_sent = 0;
+        }
+    }
     int cur = th_find(s_view_id);
     if (s_view_id != 0 && cur < 0) {
         th_go(0, 0); /* the open thread is gone */
@@ -1482,9 +1636,36 @@ uint32_t onurb_ui_thread_reply_taken(void)
     return id;
 }
 
+uint32_t onurb_ui_thread_cancel_taken(void)
+{
+    uint32_t id = s_th_cancel_taken;
+
+    s_th_cancel_taken = 0;
+    return id;
+}
+
 uint32_t onurb_ui_thread_view(void)
 {
     return s_view_id;
+}
+
+bool onurb_ui_rec_stop_taken(void)
+{
+    bool v = s_rec_stop;
+    s_rec_stop = false;
+    return v;
+}
+
+bool onurb_ui_rec_cancel_taken(void)
+{
+    bool v = s_rec_cancel;
+    s_rec_cancel = false;
+    return v;
+}
+
+bool onurb_ui_main_view(void)
+{
+    return s_view_id == 0 && s_wp == NULL && (s_wa == NULL || lv_obj_is_hidden(s_wa));
 }
 
 esp_err_t onurb_ui_start(void)

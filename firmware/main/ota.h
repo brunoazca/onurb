@@ -21,3 +21,9 @@ void onurb_ota_set_busy(bool busy);
  * Downloads in a background task; reboots only from here, when idle.
  * Returns true if it showed something on screen (caller may refresh). */
 bool onurb_ota_tick(void);
+
+/* Battery / doze telemetry sent with each update check (gateway battery log). */
+void onurb_ota_set_power_status(const char *s);
+/* Check (and report status) as soon as Wi-Fi is up, e.g. after a doze. */
+void onurb_ota_check_soon(void);
+bool onurb_ota_busy_downloading(void);
