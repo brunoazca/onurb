@@ -572,6 +572,25 @@ static void fb_discard(void)
     s_fb_csv = NULL;
 }
 
+/* Red circle with the X for FEEDBACK_MS: tapping it labels this gesture window "wrong"
+ * (a false trigger). Takes ownership of csv (malloc'd). Used after a cancel and after a
+ * gesture recording was dropped for no voice (Bruno, 2026-11-11: explicit negatives only). */
+static void fb_offer(char *csv, size_t len, const char *detail)
+{
+#if ONURB_UI_HAS_CANCELLED
+    fb_discard();
+    s_fb_csv = csv;
+    s_fb_len = len;
+    strlcpy(s_fb_detail, detail ? detail : "", sizeof(s_fb_detail));
+    onurb_ui_set_state(ONURB_UI_CANCELLED, 0);
+    onurb_ui_cancel_taken();                     /* an earlier tap doesn't count */
+    s_ui_mode = UI_FEEDBACK;
+    s_ui_until_us = esp_timer_get_time() + (int64_t)FEEDBACK_MS * 1000;
+#else
+    free(csv);
+#endif
+}
+
 static void upload_phase(onurb_turn_phase_t p)
 {
     if (p == ONURB_TURN_WAITING) {
@@ -856,8 +875,9 @@ static void present_next(void)
         notice(msg, ONURB_UI_COLOR_ERROR, 3000);
     } else if (job->reply == NULL) {             /* gateway heard nothing: no notice */
         ESP_LOGI(TAG, "request #%d: no speech - dismissed", job->seq);
-        if (job->gesture_csv) {                  /* gesture-started and dismissed: false trigger */
-            gesture_post(job->gesture_csv, job->gesture_len, "wrong", job->gesture_detail);
+        if (job->gesture_csv) {                  /* gesture-started, nothing for Onurb: offer the red X */
+            fb_offer(job->gesture_csv, job->gesture_len, job->gesture_detail);
+            job->gesture_csv = NULL;
         }
     } else {
         ESP_LOGI(TAG, "request #%d reply: %s", job->seq, job->text);
@@ -1429,8 +1449,16 @@ static void gesture_turn(void)
     if (onurb_imu_gesture_csv(&csv, &len)) {
         /* accepted but the recording was dropped (nobody spoke): a false trigger -> negative
          * example for training (Bruno, 2026-11-10) */
-        gesture_post(csv, len, !accepted ? "rejected" : s_last_job ? "accepted" : "wrong",
-                                         detail);
+        /* accepted but dropped on the watch (no voice): kept as "timeout" (unlabelled); the red
+         * X makes it a negative if the user taps it */
+        gesture_post(csv, len, !accepted ? "rejected" : s_last_job ? "accepted" : "timeout", detail);
+        if (accepted && s_last_job == NULL) {
+            char *fb = malloc(len);
+            if (fb) {
+                memcpy(fb, csv, len);
+                fb_offer(fb, len, detail);
+            }
+        }
         turn_job_t *job = accepted ? s_last_job : NULL;
         char *copy = job ? malloc(len) : NULL;
         if (copy) {                              /* kept with the request: cancel -> "wrong gesture" tap */

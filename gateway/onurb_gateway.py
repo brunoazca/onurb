@@ -577,13 +577,17 @@ class Handler(BaseHTTPRequestHandler):
         detail = re.sub(r"[^0-9A-Za-z=;./-]", "", self.headers.get("X-Onurb-Detail", ""))[:96]
         out = RECEIVED / "gesture_feedback" / f"{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_{label}.csv"
         out.parent.mkdir(exist_ok=True)
-        if label == "wrong":   # same window posted earlier as "accepted" (dismissed turn): relabel it
-            for old_f in sorted(out.parent.glob("*_accepted.csv"))[-30:]:
+        if label == "wrong":   # same window posted earlier (accepted / timeout): relabel, don't duplicate
+            if any(f.read_bytes() == body for f in sorted(out.parent.glob("*_wrong.csv"))[-30:]):
+                log(f"mouth pose entry ({detail}): user says WRONG (already labelled)")
+                return self._send(200, b'{"ok":true}')
+            olds = sorted(out.parent.glob("*_accepted.csv"))[-30:] + sorted(out.parent.glob("*_timeout.csv"))[-30:]
+            for old_f in olds:
                 if old_f.read_bytes() == body:
-                    out = old_f.with_name(old_f.name.replace("_accepted", "_wrong"))
+                    out = old_f.with_name(re.sub(r"_(accepted|timeout)\.csv$", "_wrong.csv", old_f.name))
                     old_f.rename(out)
                     old_f.with_suffix(".txt").unlink(missing_ok=True)
-                    log(f"  {old_f.name} -> {out.name} (dismissed: false trigger)")
+                    log(f"  {old_f.name} -> {out.name} (red X: false trigger)")
                     break
         out.write_bytes(body)
         (out.with_suffix(".txt")).write_text(f"label: {label}\ndetail: {detail}\n")
@@ -900,7 +904,7 @@ class Handler(BaseHTTPRequestHandler):
                     reply, action, state = agent.run_turn(text, lang, turn, f"http://127.0.0.1:{cfg.port}",
                                                           note, thread, gesture=gesture)
                     if reply == agent.DISMISS_TAG:   # gesture fired by accident: same as "no speech"
-                        log(f"  dismissed as a false gesture trigger (heard {text!r})")
+                        log(f"  dismissed as a false gesture trigger (heard {text!r}); {mark_false_trigger()}")
                         return self._send(204) if not queued else self._send(200, json.dumps({"ok": True, "queued": True}).encode())
                 elif cfg.brain == "instinct":
                     reply = brain_instinct(text, lang, cfg.instinct_jid, note)
