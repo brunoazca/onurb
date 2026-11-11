@@ -167,6 +167,8 @@ static void ota_task(void *arg)
     char digest[65];
     if (!fetch_info(digest)) {
         ESP_LOGD(TAG, "no firmware offered");
+        /* unreachable (gateway restarting, Wi-Fi flaky): try again in 5 min, not in an hour */
+        s_next_check_us = esp_timer_get_time() + 5LL * 60 * 1000000;
         s_task_running = false;
         vTaskDelete(NULL);
         return;
