@@ -76,7 +76,7 @@ static const char *TAG = "onurb_ui";
 /* While processing, the main circle itself is the cancel control (X icon). */
 #define CANCEL_EXT_CLICK  24
 #define COLOR_DOT_PRESSED 0x6A6A6A
-#define HINT_IDLE   "Hold BOOT to record"
+#define HINT_IDLE   ""   /* idle: no hint (Bruno, 2026-11-11) */
 #define HINT_CANCEL "Tap to cancel"
 #define HINT_WRONG  "Tap if the gesture was wrong" /* ~290 px; fits the rounded bottom */
 #define COLOR_DOT_CANCELLED 0xFF453A /* iOS red */
@@ -1795,7 +1795,7 @@ esp_err_t onurb_ui_start(void)
 
     s_status = make_label(scr, &lv_font_montserrat_28, 0xFFFFFF, LV_ALIGN_BOTTOM_MID, -100);
     s_hint = make_label(scr, &lv_font_montserrat_20, 0x808080, LV_ALIGN_BOTTOM_MID, -60);
-    lv_label_set_text(s_status, "Ready");
+    lv_label_set_text(s_status, "");
     lv_label_set_text(s_hint, HINT_IDLE);
 
     make_cancel();
@@ -2086,7 +2086,7 @@ void onurb_ui_set_state(onurb_ui_state_t state, float seconds)
         break;
     case ONURB_UI_IDLE:
     default:
-        snprintf(buf, sizeof(buf), "Ready");
+        buf[0] = '\0';                     /* idle: no "Ready" text (Bruno, 2026-11-11) */
         break;
     }
     bsp_display_lock(0);
