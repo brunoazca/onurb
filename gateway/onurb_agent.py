@@ -694,6 +694,13 @@ def start_code_task(task, turn, gateway, lang_hint="pt"):
                     if not any(item[2] == tid for item in INBOX):
                         break
                 time.sleep(1)
+            # A restart kills running tasks (they are the gateway's children): wait for them
+            # (lost a background task this way on 2026-11-11).
+            for _ in range(60 * 60):
+                with LOCK:
+                    if not any(t["state"] == "running" for t in TASKS.values()):
+                        break
+                time.sleep(1)
             log(f"code task {tid}: gateway code changed - restarting the gateway")
             RESTART_HOOK()
     threading.Thread(target=work, daemon=True, name=f"code-{tid}").start()
