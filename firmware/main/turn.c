@@ -141,7 +141,7 @@ static esp_err_t turn_post(const char *path, const int16_t *pcm, FILE *src, size
     esp_http_client_set_header(client, "Content-Type", "audio/wav");
     esp_http_client_set_header(client, "Accept", "audio/wav");
     esp_http_client_set_header(client, "X-Onurb-Turn-Id", turn_id);
-    esp_http_client_set_header(client, "X-Onurb-Trigger", "button");
+    esp_http_client_set_header(client, "X-Onurb-Trigger", meta && meta->trigger[0] ? meta->trigger : "button");
     if (meta && meta->reply_to[0]) {
         esp_http_client_set_header(client, "X-Onurb-Thread", meta->reply_to);
     }

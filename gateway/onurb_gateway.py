@@ -500,6 +500,29 @@ def firmware_image(path):
 REPLY_TEXT_MAX = 400          # chars shown on the watch
 
 
+def mark_false_trigger(max_age_s=15 * 60):
+    """The user said (by voice) the last gesture was a false positive: relabel the newest
+    accepted gesture window as wrong (training negative)."""
+    fb = RECEIVED / "gesture_feedback"
+    cands = sorted(fb.glob("*_accepted.csv"))
+    if not cands:
+        return "No recent gesture to label."
+    f = cands[-1]
+    try:
+        when = dt.datetime.strptime(f.name[:15], "%Y%m%d_%H%M%S")
+    except ValueError:
+        when = None
+    if when and (dt.datetime.now() - when).total_seconds() > max_age_s:
+        return "The last gesture was more than 15 minutes ago; nothing labeled."
+    out = f.with_name(f.name.replace("_accepted", "_wrong"))
+    f.rename(out)
+    txt = f.with_suffix(".txt")
+    if txt.exists():
+        txt.rename(out.with_suffix(".txt"))
+    log(f"  {f.name} -> {out.name} (the user said: false positive)")
+    return f"Labeled the gesture at {when:%H:%M} as a false trigger." if when else "Labeled."
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "OnurbGateway/0.1"
 
@@ -538,7 +561,7 @@ class Handler(BaseHTTPRequestHandler):
         log(f"imu capture #{cap} [{label}]: {samples} samples -> {folder}/{out.name}")
         self._send(200, b'{"ok":true}')
 
-    def _gesture_feedback(self):
+    def _gesture_feedback(self):  # noqa: C901
         """Store a trained-gesture match + the user's green/red verdict with its
         raw IMU segment, for retraining (tools/gesture_train.py)."""
         cfg = self.server.cfg
@@ -616,6 +639,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps({"task_id": tid}).encode())
         if self.path == "/internal/propose_purchase":
             return self._send(200, json.dumps(agent.propose_purchase(body, turn)).encode())
+        if self.path == "/internal/false_trigger":
+            return self._send(200, json.dumps({"result": mark_false_trigger()}).encode())
         if self.path == "/internal/code":
             tid, err = agent.start_code_task(body.get("task", ""), turn, f"http://127.0.0.1:{cfg.port}")
             return self._send(200, json.dumps({"task_id": tid, "error": err}).encode())
@@ -692,6 +717,7 @@ class Handler(BaseHTTPRequestHandler):
         if turn:
             CANCELLED.add(turn)
             log(f"turn {turn[:8]}: CANCEL requested by the watch")
+            agent.cancel_turn(turn)   # stop the agent now (it would otherwise run to the end)
         self._send(200, b'{"ok":true}')
 
     def _proxied(self, method):
@@ -837,10 +863,12 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 note = "(recorded offline, sent late) "
         tilt = self.headers.get("X-Onurb-Tilt", "")
+        gesture = self.headers.get("X-Onurb-Trigger", "") == "gesture"
         thread = re.sub(r"[^0-9a-f]", "", self.headers.get("X-Onurb-Thread", ""))[:32] or None
         rec = re.sub(r"[^0-9a-z=;._]", "", self.headers.get("X-Onurb-Rec", ""))[:48]
         log(f"turn {turn[:8]}: {len(pcm) / (2 * rate):.1f} s @ {rate} Hz, body {t_up:.2f} s"
-            + (f", tilt {tilt}" if tilt else "") + (f", rec {rec}" if rec else "") + (" [queued]" if queued else ""))
+            + (f", tilt {tilt}" if tilt else "") + (f", rec {rec}" if rec else "") + (" [queued]" if queued else "")
+            + (" [gesture]" if gesture else ""))
 
         if TURN_LOCK.locked():
             log(f"  turn {turn[:8]} waits for the previous turn (one at a time keeps replies in order)")
@@ -870,7 +898,10 @@ class Handler(BaseHTTPRequestHandler):
                     log(f"  answer in thread {thread[:8]}")
                 if cfg.brain == "onurb":
                     reply, action, state = agent.run_turn(text, lang, turn, f"http://127.0.0.1:{cfg.port}",
-                                                          note, thread)
+                                                          note, thread, gesture=gesture)
+                    if reply == agent.DISMISS_TAG:   # gesture fired by accident: same as "no speech"
+                        log(f"  dismissed as a false gesture trigger (heard {text!r})")
+                        return self._send(204) if not queued else self._send(200, json.dumps({"ok": True, "queued": True}).encode())
                 elif cfg.brain == "instinct":
                     reply = brain_instinct(text, lang, cfg.instinct_jid, note)
                     state = "open" if reply.rstrip().endswith("?") else "done"

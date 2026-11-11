@@ -429,6 +429,8 @@ static thread_t s_threads[MAX_THREADS];
 static int s_nthreads;
 static bool s_threads_dirty;
 static uint32_t s_reply_to;                      /* set while recording an answer to a thread */
+static char s_rec_trigger[8] = "button";         /* what started the current recording (X-Onurb-Trigger) */
+static void gesture_post(const char *csv, size_t len, const char *label, const char *detail);
 
 static thread_t *thread_find(uint32_t id)
 {
@@ -697,6 +699,7 @@ static void start_turn(int frames, const char *edit_of)
     }
     job->thread = th->id;
     strlcpy(job->meta.rec, s_rec_diag, sizeof(job->meta.rec));
+    strlcpy(job->meta.trigger, s_rec_trigger, sizeof(job->meta.trigger));   /* gateway: gesture turns may be dismissed */
     s_reply_to = 0;
     s_last_job = job;
     s_uploading = true;
@@ -721,6 +724,14 @@ static void start_turn(int frames, const char *edit_of)
 
 /* Cancel a request still processing: thread == 0 -> the newest one (the X on
  * the main circle), else the one shown in that thread (X in its tab). */
+/* POST /v1/turns/cancel: the gateway drops the turn and stops its agent run. */
+static void cancel_worker(void *arg)
+{
+    onurb_turn_cancel((const char *)arg);
+    free(arg);
+    vTaskDelete(NULL);
+}
+
 static void cancel_request(uint32_t thread)
 {
     turn_job_t *job = NULL;
@@ -767,8 +778,15 @@ static void cancel_request(uint32_t thread)
             thread_remove(th->id);
         }
     }
-    if (id[0]) {
-        onurb_turn_cancel(id);                   /* gateway drops it (not sent to Instinct if still in STT) */
+    threads_tick(esp_timer_get_time());          /* the thread leaves PROCESSING on screen now */
+    if (id[0]) {                                 /* tell the gateway off the main loop (HTTPS can take seconds) */
+        char *arg = malloc(sizeof(id));
+        if (arg) {
+            memcpy(arg, id, sizeof(id));
+            if (xTaskCreatePinnedToCore(cancel_worker, "cancel", 8192, arg, 3, NULL, 1) != pdPASS) {
+                free(arg);
+            }
+        }
     }
 #if ONURB_UI_HAS_CANCELLED
     if (csv) {                                   /* red circle: tap again = the gesture was wrong */
@@ -839,7 +857,7 @@ static void present_next(void)
     } else if (job->reply == NULL) {             /* gateway heard nothing: no notice */
         ESP_LOGI(TAG, "request #%d: no speech - dismissed", job->seq);
         if (job->gesture_csv) {                  /* gesture-started and dismissed: false trigger */
-            onurb_turn_post_gesture_feedback(job->gesture_csv, job->gesture_len, "wrong", job->gesture_detail);
+            gesture_post(job->gesture_csv, job->gesture_len, "wrong", job->gesture_detail);
         }
     } else {
         ESP_LOGI(TAG, "request #%d reply: %s", job->seq, job->text);
@@ -898,6 +916,62 @@ static void action_show(void)
 }
 
 static void record_and_queue(stop_mode_t mode, const char *edit_of);
+
+/* Gesture windows labelled accepted / wrong are training data: when the post fails (Wi-Fi
+ * dozing or away), keep them (PSRAM) and retry once online. "rejected" ones are dropped:
+ * there are ~100 a day and they would cost radio time. */
+#define FB_QUEUE_MAX 8
+static struct {
+    char *csv;
+    size_t len;
+    char label[10];
+    char detail[128];
+} s_fbq[FB_QUEUE_MAX];
+static int s_fbq_n;
+
+static void gesture_post(const char *csv, size_t len, const char *label, const char *detail)
+{
+    if (csv == NULL || len == 0) {
+        return;
+    }
+    bool online = onurb_wifi_level() >= 1;
+    if (online && onurb_turn_post_gesture_feedback(csv, len, label, detail) == ESP_OK) {
+        return;
+    }
+    if (strcmp(label, "rejected") == 0) {
+        return;
+    }
+    if (s_fbq_n == FB_QUEUE_MAX) {               /* full: the oldest goes */
+        heap_caps_free(s_fbq[0].csv);
+        memmove(&s_fbq[0], &s_fbq[1], (FB_QUEUE_MAX - 1) * sizeof(s_fbq[0]));
+        s_fbq_n--;
+    }
+    char *copy = heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+    if (copy == NULL) {
+        return;
+    }
+    memcpy(copy, csv, len);
+    s_fbq[s_fbq_n].csv = copy;
+    s_fbq[s_fbq_n].len = len;
+    strlcpy(s_fbq[s_fbq_n].label, label, sizeof(s_fbq[0].label));
+    strlcpy(s_fbq[s_fbq_n].detail, detail ? detail : "", sizeof(s_fbq[0].detail));
+    s_fbq_n++;
+    ESP_LOGI(TAG, "gesture window (%s) queued for upload (%d waiting)", label, s_fbq_n);
+}
+
+static void gesture_queue_tick(int64_t now)
+{
+    static int64_t next_us;
+    if (s_fbq_n == 0 || now < next_us || onurb_wifi_level() < 1 || s_uploading) {
+        return;
+    }
+    next_us = now + 30LL * 1000000;
+    if (onurb_turn_post_gesture_feedback(s_fbq[0].csv, s_fbq[0].len, s_fbq[0].label, s_fbq[0].detail) == ESP_OK) {
+        heap_caps_free(s_fbq[0].csv);
+        memmove(&s_fbq[0], &s_fbq[1], (FB_QUEUE_MAX - 1) * sizeof(s_fbq[0]));
+        s_fbq_n--;
+    }
+}
 
 /* Confirm / Cancel / Edit on the preview. */
 static void action_tick(int64_t now)
@@ -1013,7 +1087,7 @@ static void pipeline_tick(void)
 #if ONURB_UI_HAS_CANCEL
         if (onurb_ui_cancel_taken() && s_fb_csv) {
             ESP_LOGI(TAG, "user: that gesture was wrong (%s)", s_fb_detail);
-            onurb_turn_post_gesture_feedback(s_fb_csv, s_fb_len, "wrong", s_fb_detail);
+            gesture_post(s_fb_csv, s_fb_len, "wrong", s_fb_detail);
             fb_discard();
             notice("Marked as wrong gesture", ONURB_UI_COLOR_BUSY, 1500);
         } else
@@ -1032,6 +1106,7 @@ static void pipeline_tick(void)
         s_ui_mode = UI_IDLE;
     }
     threads_tick(now);
+    gesture_queue_tick(now);
 #if ONURB_UI_HAS_THREAD_CANCEL
     uint32_t cancel_th = onurb_ui_thread_cancel_taken();
     if (cancel_th) {
@@ -1304,6 +1379,8 @@ static int record(stop_mode_t mode, int16_t **out)
  * the pipeline; the main loop is free again right after. */
 static void record_and_queue(stop_mode_t mode, const char *edit_of)
 {
+    strlcpy(s_rec_trigger, s_reply_to ? "thread" : mode == STOP_ON_MOTION ? "gesture" : "button",
+            sizeof(s_rec_trigger));
     fb_discard();                                /* a new request ends the feedback window */
     s_last_job = NULL;
     if (!wait_upload_free()) {
@@ -1352,7 +1429,7 @@ static void gesture_turn(void)
     if (onurb_imu_gesture_csv(&csv, &len)) {
         /* accepted but the recording was dropped (nobody spoke): a false trigger -> negative
          * example for training (Bruno, 2026-11-10) */
-        onurb_turn_post_gesture_feedback(csv, len, !accepted ? "rejected" : s_last_job ? "accepted" : "wrong",
+        gesture_post(csv, len, !accepted ? "rejected" : s_last_job ? "accepted" : "wrong",
                                          detail);
         turn_job_t *job = accepted ? s_last_job : NULL;
         char *copy = job ? malloc(len) : NULL;

@@ -23,6 +23,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "qmi8658.h"
 
@@ -53,6 +54,7 @@ static const char *TAG = "onurb_imu";
 #define DWELL_PITCH_MAX    50.0f   /* some raises settle at pitch +27..+45 */
 #define DWELL_ROLL_ABS_MIN 75.0f   /* 120 rejected the lying-down raises (|roll| ~100) */
 #define POST_SAMPLES       50      /* 1 s after entry kept for training */
+#define FB_PRE             100     /* 2 s before entry kept for training (> WIN: the model's window) */
 /* End of a gesture-started recording. 120 dps / 60 ms cut users off mid-
  * sentence (hand moves while talking), so it now takes either leaving the
  * mouth area (lowering the arm) or a deliberate strong flick. */
@@ -86,7 +88,8 @@ static volatile bool s_gesture_pending;     /* decision ready for the main loop 
 static volatile bool s_gesture_csv_ready;   /* window incl. post-entry samples ready */
 static bool s_gesture_accepted;
 static char s_gesture_detail[128];
-static char s_gesture_csv[16 * 1024];
+#define GESTURE_CSV_CAP    (16 * 1024)
+static char *s_gesture_csv;            /* PSRAM (internal RAM is scarce: docs/WATCH_CONSTRAINTS.md) */
 static size_t s_gesture_csv_len;
 
 static void tilt(const qmi8658_data_t *d, float *pitch, float *roll)
@@ -193,21 +196,22 @@ static void candidate_step(bool in_dwell)
         bool accept = s_cand_gate && s_cand_prob >= gesture_threshold && s_cand_dwell >= DWELL_MIN;
         size_t n = strlen(s_gesture_detail);
         snprintf(s_gesture_detail + n, sizeof(s_gesture_detail) - n, ";dwell=%d/%d;entry=%d",
-                 s_cand_dwell, DWELL_SAMPLES, WIN);
+                 s_cand_dwell, DWELL_SAMPLES, s_cand_entry >= FB_PRE ? FB_PRE : (int)s_cand_entry);
         ESP_LOGI(TAG, "mouth pose: %s -> %s", s_gesture_detail, accept ? "GESTURE" : "rejected");
         s_gesture_accepted = accept;
         s_gesture_csv_ready = false;
         s_gesture_pending = true;               /* main loop may open the screen now */
     }
     if (since == POST_SAMPLES) {
-        uint32_t start = s_cand_entry - WIN;
-        s_gesture_csv_len = snprintf(s_gesture_csv, sizeof(s_gesture_csv), "t_ms,ax,ay,az,gx,gy,gz\n");
-        for (uint32_t i = 0; i <= WIN + POST_SAMPLES; i++) {
+        uint32_t pre = s_cand_entry >= FB_PRE ? FB_PRE : s_cand_entry;   /* ring holds 160: 100 + 50 fit */
+        uint32_t start = s_cand_entry - pre;
+        s_gesture_csv_len = s_gesture_csv ? snprintf(s_gesture_csv, GESTURE_CSV_CAP, "t_ms,ax,ay,az,gx,gy,gz\n") : 0;
+        for (uint32_t i = 0; s_gesture_csv && i <= pre + POST_SAMPLES; i++) {
             const float *r = s_ring[(start + i) % RING];
-            int w = snprintf(s_gesture_csv + s_gesture_csv_len, sizeof(s_gesture_csv) - s_gesture_csv_len,
+            int w = snprintf(s_gesture_csv + s_gesture_csv_len, GESTURE_CSV_CAP - s_gesture_csv_len,
                              "%d,%.3f,%.3f,%.3f,%.1f,%.1f,%.1f\n", (int)i * SAMPLE_MS,
                              r[0], r[1], r[2], r[3], r[4], r[5]);
-            if (w <= 0 || s_gesture_csv_len + w >= sizeof(s_gesture_csv)) {
+            if (w <= 0 || s_gesture_csv_len + w >= GESTURE_CSV_CAP) {
                 break;
             }
             s_gesture_csv_len += w;
@@ -365,6 +369,9 @@ void onurb_imu_get_tilt(float *pitch, float *roll)
 
 esp_err_t onurb_imu_start(void)
 {
+    if (s_gesture_csv == NULL) {
+        s_gesture_csv = heap_caps_malloc(GESTURE_CSV_CAP, MALLOC_CAP_SPIRAM);
+    }
     esp_err_t err = qmi8658_init(&s_dev, bsp_i2c_get_handle(), QMI8658_ADDRESS_HIGH);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "QMI8658 init failed: %s", esp_err_to_name(err));

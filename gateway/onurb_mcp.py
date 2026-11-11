@@ -72,6 +72,12 @@ TOOLS = [
                         "required": ["title", "site", "url", "total_usd", "details"]},
     },
     {
+        "name": "mark_false_trigger",
+        "description": ("The user says the last raise-to-mouth gesture fired by accident (false positive). "
+                        "Labels its recorded wrist movement as a false trigger so the gesture model learns from it."),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "start_code_task",
         "description": (
             "Change Onurb itself: the watch firmware (screens, buttons, timeouts, behavior), the "
@@ -129,6 +135,9 @@ def run_tool(name, args):
             return "Not proposed: " + r["error"]
         return ("Purchase preview sent to the watch. Nothing is bought until the user taps Confirm; "
                 "do not place the order yourself.")
+    if name == "mark_false_trigger":
+        r = call_gateway("/internal/false_trigger", {})
+        return r.get("result", "")
     if name == "start_code_task":
         r = call_gateway("/internal/code", {"task": args.get("task", ""), "turn": TURN})
         if r.get("error"):

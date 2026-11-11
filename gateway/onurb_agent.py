@@ -73,7 +73,7 @@ READ_TOOLS = [
 ONURB_TOOLS = ["mcp__onurb__route_to_instinct", "mcp__onurb__propose_whatsapp",
                "mcp__onurb__start_background_task", "mcp__onurb__list_background_tasks",
                "mcp__onurb__cancel_background_task", "mcp__onurb__start_code_task",
-               "mcp__onurb__propose_purchase"]
+               "mcp__onurb__propose_purchase", "mcp__onurb__mark_false_trigger"]
 
 # Code tasks (2026-11-11, the user: "sim, mas nem me peça permissão. Só no repo do onurb"):
 # edit/build Onurb itself without asking. Scope: this repo only. No WhatsApp, web or browser
@@ -142,6 +142,7 @@ What you can do:
 - Groceries, to-dos, reminders, or anything Instinct already handles: route_to_instinct, then relay its answer briefly.
 - herdr: quick things (what's blocked, answer a prompt, prompt an agent) directly with the herdr skill; watching it over time ("fica olhando") as a background task.
 - Anything long (deep research, multi-step browsing, computer use): start_background_task with a complete description, then reply that you're on it.
+- "Foi falso positivo" / "alarme falso" / "não era com você" / "o gesto disparou sozinho": call mark_false_trigger (labels the last gesture as a false trigger for retraining), then reply very briefly.
 - Buying a physical item ("compra", "pede", "preciso de"): start_background_task telling it to use the `shopping` skill, with the item, quantity, specs and urgency the user gave. The task picks the best option and puts a purchase preview on the watch; only the user's Confirm buys it.
 - Changes to Onurb itself (the watch's screens/behavior/firmware, the gateway, your own prompts or tools): start_code_task with a complete spec of what the user wants (their words, the screen or behavior involved, edge cases). Don't ask for confirmation: the user pre-approved code changes to Onurb. Ask only if the request itself is ambiguous. Then say you're on it.
 
@@ -232,6 +233,8 @@ THREADS = collections.OrderedDict()  # turn id -> {sid, heard, reply, state}
 THREADS_MAX = 40
 OPEN_TAG = "[[OPEN]]"
 INSTINCT_WAIT = set()                # turns waiting for Instinct's real answer
+TURN_PROCS = {}                      # turn id -> running claude -p (killed when the watch cancels)
+CANCELLED_TURNS = set()
 
 # Project skills for the agent (cwd = received/, which is gitignored): link them in.
 _SKILLS = RECEIVED / ".claude" / "skills"
@@ -271,6 +274,8 @@ def _claude(prompt, system, model, tools, turn, gateway, resume=None, timeout=TU
     try:
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                 cwd=str(cwd or RECEIVED), stdin=subprocess.DEVNULL, start_new_session=True)
+        with LOCK:
+            TURN_PROCS[turn] = proc
         if on_start:
             on_start(proc)
         try:
@@ -282,6 +287,8 @@ def _claude(prompt, system, model, tools, turn, gateway, resume=None, timeout=TU
         r = subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
     finally:
         os.unlink(mcp)
+        with LOCK:
+            TURN_PROCS.pop(turn, None)
     try:
         out = json.loads(r.stdout)
     except ValueError:
@@ -289,6 +296,16 @@ def _claude(prompt, system, model, tools, turn, gateway, resume=None, timeout=TU
     if out.get("is_error"):
         raise RuntimeError(f"agent error: {str(out.get('result'))[-300:]}")
     return (out.get("result") or "").strip(), out.get("session_id")
+
+
+def cancel_turn(turn):
+    """The watch cancelled this turn: stop its agent run now instead of letting it finish."""
+    with LOCK:
+        proc = TURN_PROCS.get(turn)
+        CANCELLED_TURNS.add(turn)
+    if proc and proc.poll() is None:
+        _kill(proc)
+        log(f"  turn {turn[:8]}: agent run stopped (cancelled on the watch)")
 
 
 def thread_state(reply, turn):
@@ -363,9 +380,20 @@ def _remember_thread(tid, **kw):
             THREADS.popitem(last=False)
 
 
-def run_turn(text, lang, turn, gateway, note="", thread=None):
-    """Spoken turn. Returns (reply, action_id or None, thread state).
+DISMISS_TAG = "[[DISMISS]]"
+GESTURE_NOTE = ("(This recording was started by the raise-to-mouth wrist gesture, which often fires by accident. "
+                f"If what you hear is not a request or question addressed to you (background conversation, the user "
+                f"talking to someone else, TV/music, a fragment that makes no sense on its own), reply exactly "
+                f"{DISMISS_TAG} and nothing else: the watch then drops it silently and learns from the false trigger. "
+                "When in doubt between a real short request and noise, answer it.) ")
+
+
+def run_turn(text, lang, turn, gateway, note="", thread=None, gesture=False):
+    """Spoken turn. Returns (reply, action_id or None, thread state); reply == DISMISS_TAG when a
+    gesture-started recording wasn't meant for Onurb (the gateway drops it as a false trigger).
     thread: the turn id of an earlier request the user is answering on the watch."""
+    if gesture and not thread:
+        note = GESTURE_NOTE + note
     with LOCK:
         th = dict(THREADS[thread]) if thread in THREADS else None
     if th:
@@ -379,10 +407,13 @@ def run_turn(text, lang, turn, gateway, note="", thread=None):
     try:
         reply, sid = _claude(prompt, TURN_PROMPT, TURN_MODEL, READ_TOOLS + ONURB_TOOLS, turn, gateway, resume)
     except RuntimeError as e:
-        if not resume:
+        if not resume or turn in CANCELLED_TURNS:   # killed by a cancel: don't run it again
             raise
         log(f"  resume failed ({e}); fresh session")
         reply, sid = _claude(prompt, TURN_PROMPT, TURN_MODEL, READ_TOOLS + ONURB_TOOLS, turn, gateway)
+    if gesture and DISMISS_TAG in reply:
+        log(f"  agent ({time.monotonic() - t0:.1f} s): not addressed to Onurb - false gesture trigger")
+        return DISMISS_TAG, None, "done"
     SESSION.update(id=sid, t=time.time())
     log(f"  agent ({time.monotonic() - t0:.1f} s, {'resumed' if resume else 'new'} session"
         + (f", thread {thread[:8]}" if th else "") + ")")

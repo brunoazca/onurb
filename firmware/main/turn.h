@@ -29,6 +29,7 @@ typedef struct {
     char heard[ONURB_HEARD_CAP];
     char action[ONURB_ACTION_ID_LEN];  /* X-Onurb-Action on GET (inbox) replies */
     char rec[48];                      /* in: X-Onurb-Rec diagnostics ("audio=..;wall=..") */
+    char trigger[8];                   /* in: X-Onurb-Trigger "gesture" | "thread" | "button" ("" = button) */
 } onurb_turn_meta_t;
 
 /* POST mono s16 PCM as WAV to CONFIG_ONURB_API_BASE_URL/v1/turns (SPEC §9.1)
