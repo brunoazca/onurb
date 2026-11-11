@@ -73,6 +73,12 @@ enum {
     ONURB_UI_ACTION_EDIT = 3,
 };
 void onurb_ui_show_whatsapp(const char *name, const uint16_t *avatar_rgb565, const char *const *msgs, int n);
+/* Purchase approval (Onurb shopping): same modal with the product photo
+ * (img_px x img_px RGB565, 96 or 120; NULL = none) in a rounded square, the
+ * title, then msgs[0] (the total) large and the rest (considerations) as
+ * gray notes; Cancel / Confirm only. onurb_ui_action_taken() as above. */
+void onurb_ui_show_purchase(const char *title, const uint16_t *img_rgb565, int img_px, const char *const *msgs,
+                            int n);
 int onurb_ui_action_taken(void);
 
 /* Pending-request indicator: short horizontal dashes in a column on the left

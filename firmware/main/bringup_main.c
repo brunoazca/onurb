@@ -358,7 +358,8 @@ typedef struct {
     char action[ONURB_ACTION_ID_LEN];            /* WhatsApp preview proposed by the agent ("" = none) */
     char edit_of[ONURB_ACTION_ID_LEN];           /* set: this recording is a spoken change to that preview */
     char *action_json;                           /* fetched by the worker: {name, messages[]} */
-    uint8_t *action_avatar;                      /* 96x96 RGB565 or NULL */
+    uint8_t *action_avatar;                      /* 96x96 (contact) or 120x120 (product) RGB565, or NULL */
+    int action_avatar_px;
     char *gesture_csv;                           /* IMU window of the gesture that started it (or NULL) */
     size_t gesture_len;
     char gesture_detail[128];
@@ -386,6 +387,8 @@ static struct {
     char id[ONURB_ACTION_ID_LEN];
     char *json;
     uint8_t *avatar;
+    int avatar_px;
+    bool purchase;                               /* Confirm buys (checkout task) instead of sending */
     int64_t until_us;
 } s_action;
 static volatile bool s_inbox_busy;
@@ -583,8 +586,9 @@ static void fetch_action(turn_job_t *job)
     snprintf(path, sizeof(path), "/v1/actions/%s", job->action);
     onurb_http_get(path, 8192, (uint8_t **)&job->action_json, &len, &st, NULL, 0, NULL);
     snprintf(path, sizeof(path), "/v1/actions/%s/avatar", job->action);
-    onurb_http_get(path, 96 * 96 * 2, &job->action_avatar, &len, &st, NULL, 0, NULL);
-    if (job->action_avatar && len != 96 * 96 * 2) {
+    onurb_http_get(path, 120 * 120 * 2, &job->action_avatar, &len, &st, NULL, 0, NULL);
+    job->action_avatar_px = len == 96 * 96 * 2 ? 96 : len == 120 * 120 * 2 ? 120 : 0;
+    if (job->action_avatar && job->action_avatar_px == 0) {
         free(job->action_avatar);
         job->action_avatar = NULL;
     }
@@ -856,6 +860,7 @@ static void present_next(void)
         strlcpy(s_action.id, job->action, sizeof(s_action.id));
         s_action.json = job->action_json;
         s_action.avatar = job->action_avatar;
+        s_action.avatar_px = job->action_avatar_px;
         s_action.until_us = esp_timer_get_time() + ACTION_TTL_US;
         job->action_json = NULL;
         job->action_avatar = NULL;
@@ -879,7 +884,14 @@ static void action_show(void)
             msgs[n++] = m->valuestring;
         }
     }
-    onurb_ui_show_whatsapp(name ? name : "?", (const uint16_t *)s_action.avatar, msgs, n);
+    const char *kind = cJSON_GetStringValue(cJSON_GetObjectItem(j, "kind"));
+    if (kind && strcmp(kind, "purchase") == 0) {      /* photo, title, total + considerations */
+        onurb_ui_show_purchase(name ? name : "?", (const uint16_t *)s_action.avatar, s_action.avatar_px, msgs, n);
+    } else {
+        onurb_ui_show_whatsapp(name ? name : "?", s_action.avatar_px == 96 ? (const uint16_t *)s_action.avatar : NULL,
+                               msgs, n);
+    }
+    s_action.purchase = kind && strcmp(kind, "purchase") == 0;
     cJSON_Delete(j);
     s_ui_mode = UI_ACTION;
 #endif
@@ -896,17 +908,23 @@ static void action_tick(int64_t now)
         onurb_ui_set_state(ONURB_UI_IDLE, 0);   /* closes the preview modal (set_status doesn't) */
     }
     if (taken == 1) {
-        onurb_ui_set_status("Sending...", ONURB_UI_COLOR_BUSY);
+        bool buy = s_action.purchase;
+        onurb_ui_set_status(buy ? "Ordering..." : "Sending...", ONURB_UI_COLOR_BUSY);
         bool ok = onurb_action_post(s_action.id, "confirm") == ESP_OK;
-        ESP_LOGI(TAG, "WhatsApp %s: %s", s_action.id, ok ? "sent (confirmed on the watch)" : "send FAILED");
+        ESP_LOGI(TAG, "%s %s: %s", buy ? "purchase" : "WhatsApp", s_action.id,
+                 ok ? "confirmed on the watch" : "confirm FAILED");
         action_clear();
         onurb_haptic(ok ? ONURB_HAPTIC_DOUBLE : ONURB_HAPTIC_ERROR);
-        notice(ok ? "Sent" : "Send failed", ok ? ONURB_UI_COLOR_BUSY : ONURB_UI_COLOR_ERROR, 1500);
+        /* a purchase: the checkout runs in the background; its result arrives in the inbox */
+        notice(ok ? (buy ? "Buying - result soon" : "Sent") : (buy ? "Order failed" : "Send failed"),
+               ok ? ONURB_UI_COLOR_BUSY : ONURB_UI_COLOR_ERROR, buy ? 2500 : 1500);
     } else if (taken == 2 || now >= s_action.until_us) {
+        bool buy = s_action.purchase;
         onurb_action_post(s_action.id, "cancel");
-        ESP_LOGI(TAG, "WhatsApp %s: cancelled (%s)", s_action.id, taken == 2 ? "user" : "timeout");
+        ESP_LOGI(TAG, "%s %s: cancelled (%s)", buy ? "purchase" : "WhatsApp", s_action.id,
+                 taken == 2 ? "user" : "timeout");
         action_clear();
-        notice("Not sent", ONURB_UI_COLOR_BUSY, 1500);
+        notice(buy ? "Not bought" : "Not sent", ONURB_UI_COLOR_BUSY, 1500);
     } else if (taken == 3) {
         char id[ONURB_ACTION_ID_LEN];
         strlcpy(id, s_action.id, sizeof(id));

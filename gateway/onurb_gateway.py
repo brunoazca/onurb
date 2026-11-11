@@ -614,6 +614,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/internal/background":
             tid = agent.start_task(body.get("task", ""), turn, f"http://127.0.0.1:{cfg.port}")
             return self._send(200, json.dumps({"task_id": tid}).encode())
+        if self.path == "/internal/propose_purchase":
+            return self._send(200, json.dumps(agent.propose_purchase(body, turn)).encode())
         if self.path == "/internal/code":
             tid, err = agent.start_code_task(body.get("task", ""), turn, f"http://127.0.0.1:{cfg.port}")
             return self._send(200, json.dumps({"task_id": tid, "error": err}).encode())

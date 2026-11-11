@@ -15,6 +15,7 @@ import collections
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -35,6 +36,19 @@ TURN_TIMEOUT_S = 150
 TASK_TIMEOUT_S = 45 * 60
 SESSION_GAP_S = 15 * 60
 AVATAR_PX = 96
+PRODUCT_PX = 120                   # product photo on the watch's purchase preview
+
+# Shopping (gateway/skills/shopping): private settings, never in the repo.
+_SHOP_ENV = Path.home() / ".config" / "onurb" / "shopping.env"
+if _SHOP_ENV.exists():
+    for _line in _SHOP_ENV.read_text().splitlines():
+        _k, _, _v = _line.partition("=")
+        if _k.strip() and not _line.lstrip().startswith("#"):
+            os.environ.setdefault(_k.strip(), _v.strip().strip('"'))
+SHIP_TO = os.environ.get("ONURB_SHIP_TO", "")
+SHIP_ZIP = os.environ.get("ONURB_SHIP_ZIP", "")
+PURCHASE_MAX_USD = float(os.environ.get("ONURB_PURCHASE_MAX_USD", "100"))
+PURCHASE_TOLERANCE_USD = 1.00      # checkout may differ from the confirmed total by at most this
 
 READ_TOOLS = [
     "Bash(wacli --read-only:*)",
@@ -58,7 +72,8 @@ READ_TOOLS = [
 ]
 ONURB_TOOLS = ["mcp__onurb__route_to_instinct", "mcp__onurb__propose_whatsapp",
                "mcp__onurb__start_background_task", "mcp__onurb__list_background_tasks",
-               "mcp__onurb__cancel_background_task", "mcp__onurb__start_code_task"]
+               "mcp__onurb__cancel_background_task", "mcp__onurb__start_code_task",
+               "mcp__onurb__propose_purchase"]
 
 # Code tasks (2026-11-11, the user: "sim, mas nem me peça permissão. Só no repo do onurb"):
 # edit/build Onurb itself without asking. Scope: this repo only. No WhatsApp, web or browser
@@ -127,6 +142,7 @@ What you can do:
 - Groceries, to-dos, reminders, or anything Instinct already handles: route_to_instinct, then relay its answer briefly.
 - herdr: quick things (what's blocked, answer a prompt, prompt an agent) directly with the herdr skill; watching it over time ("fica olhando") as a background task.
 - Anything long (deep research, multi-step browsing, computer use): start_background_task with a complete description, then reply that you're on it.
+- Buying a physical item ("compra", "pede", "preciso de"): start_background_task telling it to use the `shopping` skill, with the item, quantity, specs and urgency the user gave. The task picks the best option and puts a purchase preview on the watch; only the user's Confirm buys it.
 - Changes to Onurb itself (the watch's screens/behavior/firmware, the gateway, your own prompts or tools): start_code_task with a complete spec of what the user wants (their words, the screen or behavior involved, edge cases). Don't ask for confirmation: the user pre-approved code changes to Onurb. Ask only if the request itself is ambiguous. Then say you're on it.
 
 Names (speech-to-text often mangles them; map them back):
@@ -138,6 +154,7 @@ Names (speech-to-text often mangles them; map them back):
 Never spend money, accept terms, delete things, or send messages/emails yourself. Those need the user's explicit confirmation: use propose_whatsapp, or Instinct, whose own confirmation rule applies."""
 
 TASK_PROMPT = """You cannot write or edit files, run shell commands other than `wacli --read-only` and `herdr` (see the herdr skill), or build/deploy anything; if a task needs that, say so in the result and stop.
+Exception: the `shopping` skill may add an item to a cart and open the checkout review page to read the exact total (never place the order); the order is placed only after the user confirms the propose_purchase preview on the watch.
 You are Onurb's background worker for the user (Bruno). Do the task thoroughly with the tools you have (web research, reading WhatsApp with `wacli --read-only`, calendar, the browser via Claude in Chrome for computer use such as herdr). Read and navigate freely, but never submit forms, send messages or emails, purchase, accept terms, merge/deploy or delete anything; if the task needs one of those, stop and say what is needed (for WhatsApp, call propose_whatsapp: the user confirms on the watch). Email goes through route_to_instinct.
 
 Names (speech-to-text often mangles them; map them back):
@@ -145,6 +162,8 @@ Names (speech-to-text often mangles them; map them back):
 - herdr ("hoarder", "herd", "herder", "Herd"): the user's terminal workspace running many Claude Code agents, on THIS Mac. You control it directly with the `herdr` CLI (no Cloudflare tunnel needed; that is only how Instinct, which runs elsewhere, reaches it): list agents, read their screens, prompt them, answer their permission prompts, start agents. Load the `herdr` skill first for the commands and the user's approval rules (approve read-only lookups such as MCP searches and read-only SQL; never approve writes, deletes, deploys, pushes or sending messages: tell the user).
 - wacli ("wacky"): the WhatsApp CLI. Blackbone / My Network: the user's company and its network product. Onurb: you.
 {MAC_NOTE}
+
+Shopping: shipping address {SHIP_TO_LINE}; per-purchase ceiling US$ {PURCHASE_MAX} (checkout total).
 
 Finish with a line `SPOKEN: <one or two short sentences>` in the user's language summarizing the result for the watch speaker. Put the full result above it."""
 CODE_PROMPT = f"""You are Onurb's code worker. The user (Bruno) asked, by voice from their watch, for a change to
@@ -178,6 +197,26 @@ checagem."). Put the details above it."""
 
 TURN_PROMPT = TURN_PROMPT.replace("{MAC_NOTE}", MAC_NOTE)
 TASK_PROMPT = TASK_PROMPT.replace("{MAC_NOTE}", MAC_NOTE)
+TASK_PROMPT = TASK_PROMPT.replace("{SHIP_TO_LINE}", f"{SHIP_TO} (ZIP {SHIP_ZIP})" if SHIP_TO else "not configured")
+TASK_PROMPT = TASK_PROMPT.replace("{PURCHASE_MAX}", f"{PURCHASE_MAX_USD:.0f}")
+
+CHECKOUT_PROMPT = """You are Onurb's checkout worker. The user confirmed THIS purchase on their watch a moment ago:
+{order}
+Place exactly this order now, in Claude in Chrome's "Linux" browser (the Onurb server's Chrome; never the
+"macOS" one):
+1. Open the product URL (or the site's cart if the item is already there). The cart must contain only this
+   item and quantity; remove anything else.
+2. Go to checkout. Check: same product, same seller, quantity; shipping address = {ship_to}; payment = the
+   card saved in the account. The total (item + shipping + tax) must not exceed US$ {limit:.2f}.
+3. If everything matches, place the order ("Place your order" / "Buy now" / "Pay"). This click is
+   authorized by the user's Confirm, for this order only.
+4. Stop without buying if anything differs (price above the limit, other seller, out of stock, different
+   address), or if the site asks for a card number, CVC, password, one-time code or captcha: never type
+   any of those. Report what is needed instead.
+Never buy anything else, never change account settings, never save new payment methods.
+
+Finish with the order number, the final total and the delivery date, then
+`SPOKEN: <one short sentence in Portuguese: bought or not, total, arrival>`."""
 
 
 # ------------------------------------------------------------------ state
@@ -528,13 +567,119 @@ def propose_whatsapp(to, messages, turn):
     return {"action_id": aid, "name": name}
 
 
+def _image_to_rgb565(url, px):
+    """Product photo URL -> px*px RGB565 (letterboxed on white), or None."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Onurb watch preview)"})
+        with tempfile.TemporaryDirectory() as tmp:
+            src, out = Path(tmp) / "in.img", Path(tmp) / "out"
+            with urllib.request.urlopen(req, timeout=20) as r:
+                src.write_bytes(r.read(4 * 1024 * 1024))
+            if shutil.which("ffmpeg"):
+                raw = out.with_suffix(".raw")
+                subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src), "-vf",
+                                f"scale={px}:{px}:force_original_aspect_ratio=decrease,"
+                                f"pad={px}:{px}:(ow-iw)/2:(oh-ih)/2:white", "-frames:v", "1",
+                                "-f", "rawvideo", "-pix_fmt", "rgb565le", str(raw)], check=True, capture_output=True)
+                data = raw.read_bytes()
+                return data if len(data) == px * px * 2 else None
+            bmp = out.with_suffix(".bmp")                # macOS: sips
+            subprocess.run(["sips", "-Z", str(px), "-s", "format", "bmp", str(src), "--out", str(bmp)],
+                           check=True, capture_output=True)
+            subprocess.run(["sips", "--padToHeightWidth", str(px), str(px), "--padColor", "FFFFFF", str(bmp)],
+                           check=True, capture_output=True)
+            return _bmp_to_rgb565(bmp, px)
+    except Exception as e:  # noqa: BLE001 - the preview works without a photo
+        log(f"  product photo: none ({str(e)[:80]})")
+        return None
+
+
+def propose_purchase(p, turn):
+    """Purchase preview for the watch (gateway/skills/shopping). The order is placed only on Confirm."""
+    try:
+        total = float(str(p.get("total_usd", "")).replace("$", "").replace(",", ""))
+    except ValueError:
+        return {"error": "total_usd must be a number (checkout total in USD)"}
+    if total <= 0:
+        return {"error": "total_usd must be the checkout total"}
+    if total > PURCHASE_MAX_USD:
+        return {"error": f"total US$ {total:.2f} is above the per-purchase ceiling of US$ {PURCHASE_MAX_USD:.0f}; "
+                         "pick an option under it or tell the user"}
+    title = re.sub(r"\s{2,}", " ", EMOJI_RE.sub("", str(p.get("title", "")))).strip()[:90]
+    details = [re.sub(r"\s{2,}", " ", EMOJI_RE.sub("", str(d))).strip() for d in (p.get("details") or [])]
+    details = [d[:200] for d in details if d][:6]
+    if not title or not p.get("url"):
+        return {"error": "title and url are required"}
+    aid = uuid.uuid4().hex[:12]
+    action = {"id": aid, "kind": "purchase", "name": title, "site": str(p.get("site", ""))[:40],
+              "url": str(p["url"])[:500], "total": total, "details": details,
+              "messages": [f"US$ {total:.2f}" + (f" · {p.get('site')}" if p.get("site") else "")] + details,
+              "avatar": _image_to_rgb565(str(p.get("image_url", "")), PRODUCT_PX) if p.get("image_url") else None,
+              "avatar_px": PRODUCT_PX, "state": "pending", "turn": turn, "t": time.time()}
+    with LOCK:
+        ACTIONS[aid] = action
+        PROPOSED_BY_TURN[turn] = aid
+    log(f"  purchase proposal {aid}: {title!r} US$ {total:.2f} at {action['site']}, photo {'yes' if action['avatar'] else 'no'}")
+    return {"action_id": aid}
+
+
+def _purchase_log(a, result):
+    f = RECEIVED / "purchases.csv"
+    new = not f.exists()
+    with open(f, "a") as fh:
+        if new:
+            fh.write("time,action,site,total_usd,title,url,result\n")
+        clean = lambda x: str(x).replace(",", " ").replace("\n", " ")[:200]
+        fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},{a['id']},{clean(a['site'])},{a['total']:.2f},"
+                 f"{clean(a['name'])},{clean(a['url'])},{clean(result)}\n")
+
+
+def _checkout(aid):
+    """After the watch Confirm: place exactly the confirmed order (background)."""
+    with LOCK:
+        a = ACTIONS[aid]
+    order = (f"- {a['name']}\n- site: {a['site']}\n- product page: {a['url']}\n"
+             f"- confirmed total: US$ {a['total']:.2f}\n- notes shown to the user: {'; '.join(a['details'])}")
+    prompt = CHECKOUT_PROMPT.format(order=order, ship_to=SHIP_TO or "the account's default address",
+                                    limit=a["total"] + PURCHASE_TOLERANCE_USD)
+    tid = uuid.uuid4().hex[:8]
+    with LOCK:
+        TASKS[tid] = {"task": f"checkout {aid}: {a['name']}", "started": time.monotonic(), "state": "running",
+                      "proc": None, "turn": a.get("turn") or "", "kind": "checkout"}
+    def work():
+        log(f"  purchase {aid}: checkout task {tid} started (confirmed on the watch)")
+        try:
+            text, _ = _claude(f"Place the confirmed order {aid}.", prompt, TASK_MODEL, ["mcp__claude-in-chrome"],
+                              f"checkout-{tid}", "http://127.0.0.1:8080", timeout=20 * 60, chrome=True,
+                              on_start=lambda pr: TASKS[tid].__setitem__("proc", pr))
+        except Exception as e:  # noqa: BLE001
+            text = f"SPOKEN: A compra não foi concluída: {str(e)[:80]}"
+        m = re.search(r"SPOKEN:\s*(.+)", text, re.S)
+        spoken = (m.group(1) if m else text).strip().splitlines()[0][:300]
+        out = RECEIVED / "tasks"
+        out.mkdir(exist_ok=True)
+        (out / f"{time.strftime('%Y%m%d_%H%M%S')}_checkout_{aid}.md").write_text(f"# Checkout {aid}\n\n{order}\n\n---\n\n{text}\n")
+        with LOCK:
+            TASKS[tid]["state"] = "done"
+            TASKS[tid]["proc"] = None
+            a["state"] = "ordered" if re.search(r"order|pedido", text, re.I) else "checkout-done"
+            INBOX.append((spoken, "pt", tid, a.get("turn") or "", None))
+        _purchase_log(a, spoken)
+        log(f"  purchase {aid}: {spoken!r}")
+    threading.Thread(target=work, daemon=True, name=f"checkout-{tid}").start()
+
+
 def confirm(aid):
-    """Send exactly the previewed messages. Returns (ok, detail)."""
+    """WhatsApp: send exactly the previewed messages. Purchase: start the checkout. Returns (ok, detail)."""
     with LOCK:
         a = ACTIONS.get(aid)
         if a is None or a["state"] != "pending":
             return False, "not pending"
-        a["state"] = "sending"
+        a["state"] = "ordering" if a["kind"] == "purchase" else "sending"
+    if a["kind"] == "purchase":
+        log(f"  action {aid}: purchase CONFIRMED on the watch ({a['name']!r}, US$ {a['total']:.2f})")
+        _checkout(aid)
+        return True, "ordering"
     for m in a["messages"]:
         r = subprocess.run(["wacli", "send", "text", "--to", a["jid"], "--message", m],
                            capture_output=True, text=True, timeout=60)
@@ -562,7 +707,7 @@ def action_public(aid):
     if a is None:
         return None
     return {"id": a["id"], "kind": a["kind"], "name": a["name"], "messages": a["messages"],
-            "state": a["state"], "avatar": bool(a["avatar"]), "avatar_px": AVATAR_PX}
+            "state": a["state"], "avatar": bool(a["avatar"]), "avatar_px": a.get("avatar_px", AVATAR_PX)}
 
 
 # ------------------------------------------------------------------ background tasks
@@ -612,7 +757,9 @@ def start_task(task, turn, gateway, lang_hint="pt"):
         t0 = time.monotonic()
         log(f"task {tid}: started: {task[:120]!r}")
         try:
-            text, _ = _claude(task, TASK_PROMPT, TASK_MODEL, READ_TOOLS + ONURB_TOOLS + ["mcp__claude-in-chrome"],
+            text, _ = _claude(task, TASK_PROMPT, TASK_MODEL,
+                              READ_TOOLS + [t for t in ONURB_TOOLS if t != "mcp__onurb__start_code_task"]
+                              + ["mcp__claude-in-chrome"],
                               f"task-{tid}", gateway, timeout=TASK_TIMEOUT_S, chrome=True, on_start=started)
         except Exception as e:  # noqa: BLE001
             text = f"SPOKEN: A tarefa em segundo plano falhou: {str(e)[:80]}"

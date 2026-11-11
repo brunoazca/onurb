@@ -305,6 +305,11 @@ static lv_obj_t *s_wa_list;
 static lv_image_dsc_t s_wa_dsc;
 static uint16_t *s_wa_pixels;   /* PSRAM copy of the avatar */
 static volatile int s_wa_action; /* ONURB_UI_ACTION_* set by the LVGL task */
+static lv_obj_t *s_wa_btn_edit, *s_wa_btn_cancel, *s_wa_btn_ok;
+#define PU_IMG      120  /* purchase: product photo, drawn 1:1 */
+#define PU_NAME_Y   (WA_AVATAR_Y + PU_IMG + 8)
+#define PU_NAME_H   50   /* two lines of title */
+#define PU_LIST_Y   (PU_NAME_Y + PU_NAME_H + 6)
 
 static void wa_btn_cb(lv_event_t *e)
 {
@@ -380,9 +385,9 @@ static void make_whatsapp(lv_obj_t *scr)
     lv_obj_set_scroll_dir(s_wa_list, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(s_wa_list, LV_SCROLLBAR_MODE_ACTIVE);
 
-    wa_button(s_wa, LV_SYMBOL_EDIT, COLOR_WA_BTN, -WA_BTN_GAP, ONURB_UI_ACTION_EDIT);
-    wa_button(s_wa, LV_SYMBOL_CLOSE, COLOR_WA_BTN, 0, ONURB_UI_ACTION_CANCEL);
-    wa_button(s_wa, LV_SYMBOL_OK, COLOR_WA_GREEN, WA_BTN_GAP, ONURB_UI_ACTION_CONFIRM);
+    s_wa_btn_edit = wa_button(s_wa, LV_SYMBOL_EDIT, COLOR_WA_BTN, -WA_BTN_GAP, ONURB_UI_ACTION_EDIT);
+    s_wa_btn_cancel = wa_button(s_wa, LV_SYMBOL_CLOSE, COLOR_WA_BTN, 0, ONURB_UI_ACTION_CANCEL);
+    s_wa_btn_ok = wa_button(s_wa, LV_SYMBOL_OK, COLOR_WA_GREEN, WA_BTN_GAP, ONURB_UI_ACTION_CONFIRM);
 
     lv_obj_set_hidden(s_wa, true);
 }
@@ -418,7 +423,7 @@ static void wa_initial(const char *name, char out[5])
 }
 
 /* Caller holds the display lock. */
-static void wa_set_avatar(const uint16_t *rgb565)
+static void wa_set_avatar_px(const uint16_t *rgb565, int px)
 {
     lv_obj_set_hidden(s_wa_img, true);
     if (s_wa_pixels != NULL) {
@@ -426,10 +431,10 @@ static void wa_set_avatar(const uint16_t *rgb565)
         heap_caps_free(s_wa_pixels);
         s_wa_pixels = NULL;
     }
-    if (rgb565 == NULL) {
+    if (rgb565 == NULL || px <= 0) {
         return;
     }
-    size_t bytes = WA_AVATAR_SRC * WA_AVATAR_SRC * sizeof(uint16_t);
+    size_t bytes = (size_t)px * px * sizeof(uint16_t);
     s_wa_pixels = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
     if (s_wa_pixels == NULL) {
         ESP_LOGW(TAG, "avatar: out of PSRAM, showing initial");
@@ -439,14 +444,41 @@ static void wa_set_avatar(const uint16_t *rgb565)
     memset(&s_wa_dsc, 0, sizeof(s_wa_dsc));
     s_wa_dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
     s_wa_dsc.header.cf = LV_COLOR_FORMAT_RGB565;
-    s_wa_dsc.header.w = WA_AVATAR_SRC;
-    s_wa_dsc.header.h = WA_AVATAR_SRC;
-    s_wa_dsc.header.stride = WA_AVATAR_SRC * sizeof(uint16_t);
+    s_wa_dsc.header.w = px;
+    s_wa_dsc.header.h = px;
+    s_wa_dsc.header.stride = px * sizeof(uint16_t);
     s_wa_dsc.data_size = bytes;
     s_wa_dsc.data = (const uint8_t *)s_wa_pixels;
     lv_image_set_src(s_wa_img, &s_wa_dsc);
     lv_obj_center(s_wa_img);
     lv_obj_set_hidden(s_wa_img, false);
+}
+
+static void wa_set_avatar(const uint16_t *rgb565)
+{
+    wa_set_avatar_px(rgb565, WA_AVATAR_SRC);
+}
+
+/* Caller holds the display lock. WhatsApp layout (circle avatar, 3 buttons) or
+ * purchase layout (rounded product photo, 2-line title, Cancel / Confirm). */
+static void wa_layout(bool purchase)
+{
+    int img = purchase ? PU_IMG : WA_AVATAR;
+    lv_obj_set_size(s_wa_avatar, img, img);
+    lv_obj_set_style_radius(s_wa_avatar, purchase ? 14 : LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(s_wa_avatar, lv_color_hex(purchase ? 0xFFFFFF : COLOR_WA_AVATAR), 0);
+    lv_image_set_scale(s_wa_img, purchase ? LV_SCALE_NONE : LV_SCALE_NONE * WA_AVATAR / WA_AVATAR_SRC);
+    lv_obj_set_height(s_wa_name, purchase ? PU_NAME_H : LV_SIZE_CONTENT);
+    lv_label_set_long_mode(s_wa_name, purchase ? LV_LABEL_LONG_MODE_WRAP : LV_LABEL_LONG_MODE_DOTS);
+    lv_obj_align(s_wa_name, LV_ALIGN_TOP_MID, 0, purchase ? PU_NAME_Y : WA_NAME_Y);
+    int list_y = purchase ? PU_LIST_Y : WA_LIST_Y;
+    lv_obj_set_size(s_wa_list, WA_LIST_W, BSP_LCD_V_RES + WA_BTN_BOTTOM - WA_BTN - 12 - list_y);
+    lv_obj_align(s_wa_list, LV_ALIGN_TOP_MID, 0, list_y);
+    lv_obj_set_flex_align(s_wa_list, LV_FLEX_ALIGN_START, purchase ? LV_FLEX_ALIGN_CENTER : LV_FLEX_ALIGN_END,
+                          purchase ? LV_FLEX_ALIGN_CENTER : LV_FLEX_ALIGN_END);
+    lv_obj_set_hidden(s_wa_btn_edit, purchase);
+    lv_obj_align(s_wa_btn_cancel, LV_ALIGN_BOTTOM_MID, purchase ? -WA_BTN_GAP / 2 - 6 : 0, WA_BTN_BOTTOM);
+    lv_obj_align(s_wa_btn_ok, LV_ALIGN_BOTTOM_MID, purchase ? WA_BTN_GAP / 2 + 6 : WA_BTN_GAP, WA_BTN_BOTTOM);
 }
 
 static void wa_bubble(const char *utf8)
@@ -486,6 +518,7 @@ void onurb_ui_show_whatsapp(const char *name, const uint16_t *avatar_rgb565, con
     wa_initial(name, initial);
     bsp_display_lock(0);
     s_wa_action = ONURB_UI_ACTION_NONE;
+    wa_layout(false);
     lv_label_set_text(s_wa_name, name ? name : "");
     lv_label_set_text(s_wa_initial, initial);
     wa_set_avatar(avatar_rgb565);
@@ -498,6 +531,46 @@ void onurb_ui_show_whatsapp(const char *name, const uint16_t *avatar_rgb565, con
     lv_obj_set_hidden(s_wa, false);
     lv_obj_move_foreground(s_wa);
     lv_obj_move_foreground(s_pend); /* pending bars stay on top of the modal */
+    lv_obj_move_foreground(s_rail);
+    lv_obj_update_layout(s_wa_list);
+    lv_obj_scroll_to_y(s_wa_list, 0, LV_ANIM_OFF);
+    bsp_display_unlock();
+}
+
+void onurb_ui_show_purchase(const char *title, const uint16_t *img_rgb565, int img_px, const char *const *msgs,
+                            int n)
+{
+    if (!s_ready) {
+        return;
+    }
+    if (n > WA_MAX_MSGS) {
+        n = WA_MAX_MSGS;
+    }
+    bsp_display_lock(0);
+    s_wa_action = ONURB_UI_ACTION_NONE;
+    wa_layout(true);
+    lv_label_set_text(s_wa_name, title ? title : "");
+    lv_label_set_text(s_wa_initial, img_rgb565 ? "" : "?");
+    wa_set_avatar_px(img_rgb565, img_px == 96 || img_px == 120 ? img_px : 0);
+    if (img_rgb565 && img_px == 96) {
+        lv_image_set_scale(s_wa_img, LV_SCALE_NONE * PU_IMG / 96);
+    }
+    lv_obj_clean(s_wa_list);
+    for (int i = 0; i < n; i++) {
+        if (msgs[i] == NULL || msgs[i][0] == '\0') {
+            continue;
+        }
+        lv_obj_t *l = lv_label_create(s_wa_list);
+        lv_obj_set_width(l, WA_LIST_W - 20);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_MODE_WRAP);
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(l, i == 0 ? &onurb_font_reply_26 : &onurb_font_reply_20, 0);
+        lv_obj_set_style_text_color(l, lv_color_hex(i == 0 ? COLOR_WA_GREEN : 0xBDBDBD), 0);
+        lv_label_set_text(l, msgs[i]);
+    }
+    lv_obj_set_hidden(s_wa, false);
+    lv_obj_move_foreground(s_wa);
+    lv_obj_move_foreground(s_pend);
     lv_obj_move_foreground(s_rail);
     lv_obj_update_layout(s_wa_list);
     lv_obj_scroll_to_y(s_wa_list, 0, LV_ANIM_OFF);

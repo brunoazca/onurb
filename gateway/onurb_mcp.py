@@ -58,6 +58,20 @@ TOOLS = [
                         "required": ["task"]},
     },
     {
+        "name": "propose_purchase",
+        "description": (
+            "Put a purchase on the user's watch for confirmation (shopping skill, step 8): product "
+            "photo, title, checkout total and your considerations, with Cancel / Confirm. Nothing is "
+            "bought unless the user taps Confirm; then a checkout task places exactly this order. "
+            "Call it only after staging the item at the checkout review page."),
+        "inputSchema": {"type": "object",
+                        "properties": {"title": {"type": "string"}, "site": {"type": "string"},
+                                       "url": {"type": "string"}, "image_url": {"type": "string"},
+                                       "total_usd": {"type": "number"},
+                                       "details": {"type": "array", "items": {"type": "string"}}},
+                        "required": ["title", "site", "url", "total_usd", "details"]},
+    },
+    {
         "name": "start_code_task",
         "description": (
             "Change Onurb itself: the watch firmware (screens, buttons, timeouts, behavior), the "
@@ -109,6 +123,12 @@ def run_tool(name, args):
     if name == "start_background_task":
         r = call_gateway("/internal/background", {"task": args.get("task", ""), "turn": TURN})
         return f"Started (task {r.get('task_id')}). The result will reach the user's watch when done."
+    if name == "propose_purchase":
+        r = call_gateway("/internal/propose_purchase", {**args, "turn": TURN})
+        if r.get("error"):
+            return "Not proposed: " + r["error"]
+        return ("Purchase preview sent to the watch. Nothing is bought until the user taps Confirm; "
+                "do not place the order yourself.")
     if name == "start_code_task":
         r = call_gateway("/internal/code", {"task": args.get("task", ""), "turn": TURN})
         if r.get("error"):
