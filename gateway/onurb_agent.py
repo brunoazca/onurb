@@ -144,7 +144,7 @@ TURN_PROMPT = """You are Onurb, the user's wrist voice assistant (a smartwatch).
 Reply rules:
 - ONE short sentence, ideally under 15 words, in the user's language (pt-BR or English). No lists, links, markdown or emoji.
 - Never claim you did something you didn't.
-- Each request is its own thread on the watch. If your reply asks the user something, or you need a decision or information from them to continue, end it with " [[OPEN]]" (the watch then shows the thread as waiting and lets the user answer it by voice). Otherwise don't add it.
+- Each request is its own thread on the watch. If your reply asks the user something, or you need a decision or information from them to continue, end it with " [[OPEN]]" (the watch then shows the thread as waiting and lets the user answer it by voice). You decide when a thread is finished: end the reply with " [[DONE]]" when the request is fully handled and nothing more is needed from the user (the thread then leaves the watch; a polite "anything else?" doesn't keep it open). Never use [[DONE]] while you are waiting for the user ([[OPEN]]), a background/code task or Instinct is still working on it, or a WhatsApp/purchase preview you proposed still awaits their confirmation. If you're not sure, just say you're wrapping up and use [[DONE]]: if the user adds something on that thread later, it reopens.
 
 What you can do:
 - Read WhatsApp with `wacli --read-only ...` (chats list, messages list --chat <jid>, messages search, contacts search). You can never send with wacli.
@@ -184,7 +184,8 @@ Shopping: shipping address {SHIP_TO_LINE}; per-purchase ceiling US$ {PURCHASE_MA
 
 {MSG_LINE}
 
-Finish with a line `SPOKEN: <one or two short sentences>` in the user's language summarizing the result for the watch speaker. Put the full result above it."""
+Finish with a line `SPOKEN: <one or two short sentences>` in the user's language summarizing the result for the watch speaker. Put the full result above it.
+The task is a thread on the user's watch, and you decide whether it is finished: end the SPOKEN line with " [[DONE]]" when the task is fully handled and nothing more is needed from the user (the thread leaves the watch), or with " [[OPEN]]" when you need an answer or decision from them (the thread waits for them). Not [[DONE]] while a WhatsApp/purchase preview you proposed still awaits their confirmation."""
 CODE_PROMPT = f"""You are Onurb's code worker. The user (Bruno) asked, by voice from their watch, for a change to
 Onurb itself. You may edit files in the Onurb repo ({REPO}) and build the watch firmware, without asking
 anyone: the user pre-approved this. Only this repo; nothing else on the machine.
@@ -213,7 +214,9 @@ Rules:
 
 Finish with a line `SPOKEN: <one or two short sentences, in Portuguese>` saying what changed and whether it
 was built (e.g. "Pronto: a tela das conversas agora apaga em 1 minuto; o relógio atualiza na próxima
-checagem."). Put the details above it."""
+checagem."). Put the details above it. End the SPOKEN line with " [[DONE]]" when the change is complete and
+nothing more is needed from the user (the watch thread then goes away), or " [[OPEN]]" when you need their
+answer or decision to go on."""
 
 TURN_PROMPT = TURN_PROMPT.replace("{MAC_NOTE}", MAC_NOTE)
 TASK_PROMPT = TASK_PROMPT.replace("{MAC_NOTE}", MAC_NOTE).replace("{MSG_LINE}", MSG_LINE)
@@ -258,6 +261,7 @@ TASKS = {}                         # task id -> {task, started, state, proc, ses
 THREADS = collections.OrderedDict()  # turn id -> {sid, heard, reply, state}
 THREADS_MAX = 40
 OPEN_TAG = "[[OPEN]]"
+DONE_TAG = "[[DONE]]"               # the agent says the thread is finished (see thread_state)
 INSTINCT_WAIT = set()                # turns waiting for Instinct's real answer
 TURN_PROCS = {}                      # turn id -> running claude -p (killed when the watch cancels)
 CANCELLED_TURNS = set()
@@ -336,13 +340,18 @@ def cancel_turn(turn):
         log(f"  turn {turn[:8]}: agent run stopped (cancelled on the watch)")
 
 
-def thread_state(reply, turn):
-    """(reply without the tag, state): open = needs the user, working = a background
-    task it started is still running, done otherwise."""
+def thread_state(reply, turn, proposed=None):
+    """(reply without the tags, state): open = needs the user, working = a background
+    task it started is still running, done otherwise. The agent decides with [[OPEN]] /
+    [[DONE]] (done threads leave the watch a minute later); untagged, a trailing "?" means
+    open. [[DONE]] doesn't hold while a task / Instinct is still on it or a preview it
+    proposed (proposed = action id) awaits the user's confirmation."""
     state = "done"
+    done = DONE_TAG in reply
+    reply = reply.replace(DONE_TAG, "").strip()
     if OPEN_TAG in reply:
         reply, state = reply.replace(OPEN_TAG, "").strip(), "open"
-    elif reply.rstrip().endswith("?"):
+    elif reply.rstrip().endswith("?") and not (done and not proposed):
         state = "open"
     with LOCK:
         if (any(t.get("turn") == turn and t["state"] == "running" for t in TASKS.values())
@@ -378,9 +387,10 @@ def continue_after_instinct(turn, text, gateway):
     if reply.strip().upper().startswith("NOOP"):
         log("  (agent: not the answer yet)")
         return False
-    reply, state = thread_state(reply, "-")
     with LOCK:
         action = PROPOSED_BY_TURN.pop(f"follow-{turn[:8]}", None)
+    reply, state = thread_state(reply, "-", action)
+    with LOCK:
         INBOX.append((reply, "pt", "instinct", thread, action))
     _remember_thread(thread, sid=sid, reply=reply, state=state)
     log(f"  thread {thread[:8]}: {state} after Instinct's answer: {reply!r}" + (f" + WhatsApp {action}" if action else ""))
@@ -470,7 +480,7 @@ def run_turn(text, lang, turn, gateway, note="", thread=None, gesture=False):
         + (f", thread {thread[:8]}" if th else "") + ")")
     with LOCK:
         action = PROPOSED_BY_TURN.pop(turn, None)
-    reply, state = thread_state(reply, turn)
+    reply, state = thread_state(reply, turn, action)
     if th:      # background tasks / Instinct answers from a thread reply report to that thread
         with LOCK:
             if state == "done" and any(TASKS[tid]["state"] == "running" for tid in running):
@@ -500,7 +510,7 @@ def run_edit(action_id, instruction, turn, gateway):
     SESSION.update(id=sid, t=time.time())
     with LOCK:
         new = PROPOSED_BY_TURN.pop(turn, None)
-    return reply, new
+    return reply.replace(DONE_TAG, "").replace(OPEN_TAG, "").strip(), new   # no thread here: never speak a tag
 
 
 # ------------------------------------------------------------------ WhatsApp actions
@@ -901,9 +911,12 @@ def start_task(task, turn, gateway, lang_hint="pt"):
         spoken = (m.group(1) if m else text).strip().splitlines()[0][:300]
         with LOCK:
             thread = TASKS[tid].get("turn") or ""
-            INBOX.append((spoken, lang_hint, tid, thread, PROPOSED_BY_TURN.pop(f"task-{tid}", None)))
-        if thread in THREADS:
-            _remember_thread(thread, reply=spoken, state="open" if spoken.rstrip().endswith("?") else "done")
+            action = PROPOSED_BY_TURN.pop(f"task-{tid}", None)
+        spoken, state = thread_state(spoken, thread, action)   # its [[OPEN]] / [[DONE]] decides
+        if thread in THREADS:   # before the inbox item: the watch gets the state with it
+            _remember_thread(thread, reply=spoken, state=state)
+        with LOCK:
+            INBOX.append((spoken, lang_hint, tid, thread, action))
         log(f"task {tid}: done in {(time.monotonic() - t0) / 60:.1f} min -> watch inbox: {spoken!r}")
     threading.Thread(target=work, daemon=True, name=f"task-{tid}").start()
     return tid
@@ -957,9 +970,11 @@ def start_code_task(task, turn, gateway, lang_hint="pt"):
         spoken = (m.group(1) if m else text).strip().splitlines()[0][:300]
         with LOCK:
             thread = TASKS[tid].get("turn") or ""
+        spoken, state = thread_state(spoken, thread)   # its [[OPEN]] / [[DONE]] decides
+        if thread in THREADS:   # before the inbox item: the watch gets the state with it
+            _remember_thread(thread, reply=spoken, state=state)
+        with LOCK:
             INBOX.append((spoken, lang_hint, tid, thread, None))
-        if thread in THREADS:
-            _remember_thread(thread, reply=spoken, state="done")
         log(f"code task {tid}: done in {(time.monotonic() - t0) / 60:.1f} min -> watch inbox: {spoken!r}")
         if _code_mtimes() != before and RESTART_HOOK:
             # The gateway's own code changed: restart once the watch has the result (the inbox is in memory).
