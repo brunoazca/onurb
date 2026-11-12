@@ -79,7 +79,7 @@ watch shows preview ── Confirm ──▶ gateway executes it (agent never se
 
 - `gateway/onurb_agent.py`: runs `claude -p` (turns: Opus, resumed session within
   15 min; background tasks: Opus with `--chrome` for computer use; the user wants Opus for both). Read-only
-  tools: `wacli --read-only`, calendar, Granola, web, Claude Code transcripts.
+  tools: `wacli --read-only`, calendar, Granola, Notion (full; the default place for docs, under the user's "ONURB" page, id in `~/.config/onurb/notion.env`), web, Claude Code transcripts.
   `wacli send` is disallowed.
 - `gateway/onurb_mcp.py`: stdio MCP server with `route_to_instinct`, `propose_whatsapp`,
   `start_background_task`, which call the gateway's localhost-only `/internal/*`.

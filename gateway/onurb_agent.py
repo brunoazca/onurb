@@ -38,13 +38,17 @@ SESSION_GAP_S = 15 * 60
 AVATAR_PX = 96
 PRODUCT_PX = 120                   # product photo on the watch's purchase preview
 
-# Shopping (gateway/skills/shopping): private settings, never in the repo.
-_SHOP_ENV = Path.home() / ".config" / "onurb" / "shopping.env"
-if _SHOP_ENV.exists():
-    for _line in _SHOP_ENV.read_text().splitlines():
+# Private settings, never in the repo: shopping.env (gateway/skills/shopping: ship-to, ceiling)
+# and notion.env (ONURB_NOTION_HUB: the id of the user's "ONURB" Notion page).
+for _env in ("shopping.env", "notion.env"):
+    _f = Path.home() / ".config" / "onurb" / _env
+    if not _f.exists():
+        continue
+    for _line in _f.read_text().splitlines():
         _k, _, _v = _line.partition("=")
         if _k.strip() and not _line.lstrip().startswith("#"):
             os.environ.setdefault(_k.strip(), _v.strip().strip('"'))
+NOTION_HUB = os.environ.get("ONURB_NOTION_HUB", "")
 SHIP_TO = os.environ.get("ONURB_SHIP_TO", "")
 SHIP_ZIP = os.environ.get("ONURB_SHIP_ZIP", "")
 PURCHASE_MAX_USD = float(os.environ.get("ONURB_PURCHASE_MAX_USD", "100"))
@@ -69,6 +73,9 @@ READ_TOOLS = [
     "mcp__claude_ai_Granola__search_transcripts", "mcp__claude_ai_Granola__query_granola_meetings",
     "mcp__mynetwork__search_people", "mcp__mynetwork__get_person", "mcp__mynetwork__list_by_company",
     "mcp__mynetwork__list_by_tag", "mcp__mynetwork__network_overview",
+    # Notion (2026-11-11, the user: "enable it to use notion connector as it want and make it the
+    # default doc creation"): the whole connector. Docs go under the "ONURB" page (NOTION_HUB).
+    "mcp__claude_ai_Notion",
 ]
 ONURB_TOOLS = ["mcp__onurb__route_to_instinct", "mcp__onurb__propose_whatsapp",
                "mcp__onurb__start_background_task", "mcp__onurb__list_background_tasks",
@@ -138,6 +145,7 @@ What you can do:
 - To message someone on WhatsApp, call propose_whatsapp: the watch shows a preview and the user confirms there. Keep the user's voice; split into natural separate bubbles. No emoji (the watch can't show them).
 - Email of any kind (reading, searching, replying, sending) goes to Instinct via route_to_instinct: Instinct owns the user's mailbox.
 - People in the user's network (Blackbone My Network, their LinkedIn connections): mynetwork search_people / list_by_company / list_by_tag (investor, founder, stealth) / get_person / network_overview. Say names and roles, never ids.
+- Notion: read, search, create and edit pages freely. {NOTION_LINE}
 - Calendar (read), Granola meeting notes, the user's Claude Code session transcripts under ~/.claude/projects, web search.
 - Groceries, to-dos, reminders, or anything Instinct already handles: route_to_instinct, then relay its answer briefly.
 - herdr: quick things (what's blocked, answer a prompt, prompt an agent) directly with the herdr skill; watching it over time ("fica olhando") as a background task.
@@ -163,6 +171,8 @@ Names (speech-to-text often mangles them; map them back):
 - herdr ("hoarder", "herd", "herder", "Herd"): the user's terminal workspace running many Claude Code agents, on THIS Mac. You control it directly with the `herdr` CLI (no Cloudflare tunnel needed; that is only how Instinct, which runs elsewhere, reaches it): list agents, read their screens, prompt them, answer their permission prompts, start agents. Load the `herdr` skill first for the commands and the user's approval rules (approve read-only lookups such as MCP searches and read-only SQL; never approve writes, deletes, deploys, pushes or sending messages: tell the user).
 - wacli ("wacky"): the WhatsApp CLI. Blackbone / My Network: the user's company and its network product. Onurb: you.
 {MAC_NOTE}
+
+Documents: anything the user should read in full (lists, trackers, reports, research, drafts) goes to Notion, the default place for docs; not Claude Docs or local files. {NOTION_LINE} Give the page a clear title, use headings, tables or a database when the content is tabular, update an existing Onurb page instead of duplicating it, and put the page link in the result (never in SPOKEN). Notion is also how you hand longer material to the user's computer.
 
 Shopping: shipping address {SHIP_TO_LINE}; per-purchase ceiling US$ {PURCHASE_MAX} (checkout total).
 
@@ -198,6 +208,13 @@ checagem."). Put the details above it."""
 
 TURN_PROMPT = TURN_PROMPT.replace("{MAC_NOTE}", MAC_NOTE)
 TASK_PROMPT = TASK_PROMPT.replace("{MAC_NOTE}", MAC_NOTE)
+NOTION_LINE = (f'Create new pages as children of the user\'s "ONURB" page (page id {NOTION_HUB}); '
+               "never put them in the workspace root. Don't delete, move or publicly share pages the user made."
+               if NOTION_HUB else
+               'Create new pages under the user\'s "ONURB" page (search for it). Don\'t delete, move or '
+               "publicly share pages the user made.")
+TURN_PROMPT = TURN_PROMPT.replace("{NOTION_LINE}", NOTION_LINE)
+TASK_PROMPT = TASK_PROMPT.replace("{NOTION_LINE}", NOTION_LINE)
 TASK_PROMPT = TASK_PROMPT.replace("{SHIP_TO_LINE}", f"{SHIP_TO} (ZIP {SHIP_ZIP})" if SHIP_TO else "not configured")
 TASK_PROMPT = TASK_PROMPT.replace("{PURCHASE_MAX}", f"{PURCHASE_MAX_USD:.0f}")
 
