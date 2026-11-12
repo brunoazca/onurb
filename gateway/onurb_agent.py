@@ -135,8 +135,12 @@ What needs the user's Mac (you run ON it now, so all of it is local):
 - Claude in Chrome may list two browsers: "macOS" (the user's Chrome, on this Mac) and "Linux" (the server's
   Chrome). Select the macOS one.""" if HOST == "mac" else """
 What needs the user's Mac (you run on a server; the Mac is a remote worker that may be off or asleep):
-- herdr and its agents: `herdr --machine mac ...` (over SSH). Chrome with the user's personal logins and
-  Claude Code session transcripts are only on the Mac.
+- herdr and its agents run only on the Mac, and you can't reach them from here. You only run when the Mac's
+  gateway doesn't answer (Mac off/asleep, or its Tailscale disconnected); while it answers, the Mac's own agent
+  handles every request, herdr included. So for any herdr request (or anything else that needs the Mac): don't
+  start a task and don't call it a permission problem; reply that the Mac is out of reach (asleep or Tailscale
+  off) and that it works again as soon as the Mac is back. Chrome with the user's personal logins and
+  Claude Code session transcripts are also only on the Mac.
 - Claude in Chrome may list two browsers: select the "Linux" one (this server's Chrome: logged into claude.ai and
   Blackbone). The "macOS" one is the user's own Chrome; use it only for a site that is logged in only there,
   and only if it is connected.
