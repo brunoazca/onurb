@@ -22,3 +22,6 @@ __pycache__/
 *.pyc
 .venv/
 .DS_Store
+
+# Parallel code tasks: one git worktree each (gateway/onurb_agent.py)
+.worktrees/

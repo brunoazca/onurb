@@ -83,16 +83,28 @@ TOOLS = [
             "Change Onurb itself: the watch firmware (screens, buttons, timeouts, behavior), the "
             "gateway, or your own prompts/tools. Pre-approved by the user: no confirmation needed. "
             "A code worker edits the Onurb repo, builds the firmware (the watch updates itself) and "
-            "the result reaches the watch when done. Describe the change completely: what the user "
-            "wants, in their words, which screen/behavior, and edge cases."),
+            "the result reaches the watch when done. Several run in parallel (each in its own worktree, "
+            "merged into main when done); extra ones are queued, never refused. Describe the change "
+            "completely: what the user wants, in their words, which screen/behavior, and edge cases."),
         "inputSchema": {"type": "object", "properties": {"task": {"type": "string"}},
                         "required": ["task"]},
     },
     {
         "name": "list_background_tasks",
-        "description": ("List the background tasks started since the gateway last restarted: id, "
-                        "state (running / done / cancelled), minutes since start and the task text."),
+        "description": ("List the background tasks started since the gateway last restarted: id, kind "
+                        "(background / code / checkout), state (queued / running / done / cancelled), minutes "
+                        "since start and the task text."),
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "add_to_task",
+        "description": ("Give a new request to a task that is still running or queued, when it belongs to it "
+                        "(same change or research, a correction, a related detail), instead of starting another "
+                        "task. Its worker takes it into account; the result arrives on that task's thread. "
+                        "Pass the task id (list_background_tasks) and the user's request in their words."),
+        "inputSchema": {"type": "object", "properties": {"task_id": {"type": "string"},
+                                                         "text": {"type": "string"}},
+                        "required": ["task_id", "text"]},
     },
     {
         "name": "check_user_messages",
@@ -157,6 +169,10 @@ def run_tool(name, args):
         msgs = call_gateway("/internal/tasks/messages", {"turn": TURN}).get("messages", [])
         return ("The user added, from the watch:\n" + "\n".join(f"- {m}" for m in msgs)) if msgs else \
             "No new messages from the user."
+    if name == "add_to_task":
+        r = call_gateway("/internal/tasks/add", {"task_id": args.get("task_id", ""),
+                                                 "text": args.get("text", ""), "turn": TURN})
+        return f"Task {args.get('task_id')}: {r.get('result')}"
     if name == "cancel_background_task":
         r = call_gateway("/internal/tasks/cancel", {"task_id": args.get("task_id", "")})
         return f"Task {args.get('task_id')}: {r.get('result')}"

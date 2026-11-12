@@ -652,6 +652,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps({"tasks": agent.list_tasks()}).encode())
         if self.path == "/internal/tasks/messages":   # what the user added on the task's watch thread
             return self._send(200, json.dumps({"messages": agent.take_task_notes(turn)}).encode())
+        if self.path == "/internal/tasks/add":        # a related new request -> that task's worker
+            return self._send(200, json.dumps({"result": agent.add_to_task(
+                body.get("task_id", ""), body.get("text", ""), turn)}).encode())
         if self.path == "/internal/tasks/cancel":
             return self._send(200, json.dumps({"result": agent.cancel_task(body.get("task_id", ""))}).encode())
         self._error(404, "not found")
