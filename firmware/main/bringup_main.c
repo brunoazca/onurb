@@ -419,6 +419,7 @@ typedef enum { TH_PROCESSING, TH_WORKING, TH_DONE, TH_OPEN, TH_ERROR } th_state_
 typedef struct {
     uint32_t id;                                 /* local, = seq of the request that opened it */
     th_state_t state;
+    th_state_t before;                           /* state before an addition was sent (restored if it fails) */
     char tid[33];                                /* gateway thread id (turn id of the opening request) */
     char heard[ONURB_HEARD_CAP];
     char reply[320];
@@ -502,6 +503,15 @@ static void thread_finish(thread_t *t, const onurb_turn_meta_t *m, const char *r
     s_threads_dirty = true;
 }
 
+/* An answer/addition that didn't go through (cancelled, unsent, nothing heard): the thread goes
+ * back to what it was (waiting, working, done...), with a fresh done-TTL. */
+static void thread_restore(thread_t *t)
+{
+    t->state = t->before;
+    t->done_at = esp_timer_get_time();
+    s_threads_dirty = true;
+}
+
 /* Move the thread's current heard/reply into its history (oldest dropped when full). */
 static void thread_push_history(thread_t *t)
 {
@@ -545,8 +555,7 @@ static void threads_tick(int64_t now)
         if (!has_job && !s_uploading) {
             ESP_LOGW(TAG, "thread %lu: processing with no request - removed", (unsigned long)s_threads[i].id);
             if (s_threads[i].tid[0]) {
-                s_threads[i].state = TH_OPEN;    /* an answer that never went: the thread stays open */
-                s_threads_dirty = true;
+                thread_restore(&s_threads[i]);   /* an answer that never went: the thread stays as it was */
             } else {
                 thread_remove(s_threads[i].id);
             }
@@ -554,7 +563,8 @@ static void threads_tick(int64_t now)
     }
     for (int i = s_nthreads - 1; i >= 0; i--) {
         if ((s_threads[i].state == TH_DONE || s_threads[i].state == TH_ERROR) &&
-            now - s_threads[i].done_at > THREAD_DONE_TTL) {
+            now - s_threads[i].done_at > THREAD_DONE_TTL &&
+            !(ONURB_UI_HAS_THREADS && onurb_ui_thread_view() == s_threads[i].id)) {   /* on screen: the user may add to it */
             thread_remove(s_threads[i].id);
         }
     }
@@ -567,7 +577,7 @@ static void threads_tick(int64_t now)
         onurb_thread_t v[MAX_THREADS];
         for (int i = 0; i < s_nthreads; i++) {
             v[i] = (onurb_thread_t){s_threads[i].id, map[s_threads[i].state], s_threads[i].heard, s_threads[i].reply,
-                                    s_threads[i].hist};
+                                    s_threads[i].hist, s_threads[i].tid[0] != '\0'};   /* known to the gateway: mic */
         }
         onurb_ui_set_threads(v, s_nthreads);
     }
@@ -727,9 +737,10 @@ static void start_turn(int frames, const char *edit_of)
         strlcpy(job->edit_of, edit_of, sizeof(job->edit_of));
     }
     thread_t *th = s_reply_to ? thread_find(s_reply_to) : NULL;
-    if (th) {                                    /* spoken answer inside an open thread */
+    if (th) {                                    /* spoken answer / addition inside an existing thread */
         thread_push_history(th);                 /* the question it answers stays visible above */
         strlcpy(job->meta.reply_to, th->tid, sizeof(job->meta.reply_to));
+        th->before = th->state == TH_PROCESSING ? TH_OPEN : th->state;
         th->state = TH_PROCESSING;
         s_threads_dirty = true;
     } else {
@@ -812,9 +823,8 @@ static bool cancel_request(uint32_t thread)
     ESP_LOGI(TAG, "request #%d cancelled by the user", job->seq);
     {
         thread_t *th = thread_find(thread_id);
-        if (th && th->tid[0]) {                  /* an answer inside an existing thread: keep it open */
-            th->state = TH_OPEN;
-            s_threads_dirty = true;
+        if (th && th->tid[0]) {                  /* an answer inside an existing thread: keep it as it was */
+            thread_restore(th);
         } else if (th) {
             thread_remove(th->id);
         }
@@ -872,8 +882,7 @@ static void present_next(void)
         if (th->tid[0] == 0) {
             thread_remove(th->id);               /* never reached the agent / nothing heard */
         } else {
-            th->state = TH_OPEN;                 /* an answer that didn't go through: still open */
-            s_threads_dirty = true;
+            thread_restore(th);                  /* an answer that didn't go through: as it was */
         }
     } else if (th && job->err != ESP_OK) {
         if (job->spooled || job->spool_full) {
@@ -1168,8 +1177,9 @@ static void pipeline_tick(void)
 #endif
 #if ONURB_UI_HAS_THREADS
     uint32_t answer = onurb_ui_thread_reply_taken();
+    /* Any thread the gateway knows (waiting, working task, done, error) takes a spoken addition. */
     if (answer && (s_ui_mode == UI_IDLE || s_ui_mode == UI_PROCESSING || s_ui_mode == UI_REPLY) &&
-        thread_find(answer) && thread_find(answer)->tid[0]) {
+        thread_find(answer) && thread_find(answer)->tid[0] && thread_find(answer)->state != TH_PROCESSING) {
         ESP_LOGI(TAG, "answer by voice in thread %lu", (unsigned long)answer);
         s_reply_to = answer;
         onurb_ota_set_busy(true);

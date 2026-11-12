@@ -118,6 +118,9 @@ typedef struct {
     /* Earlier exchanges of this thread, oldest first, shown above heard/reply:
      * "heard\x1freply\x1e" per exchange (NULL/"" = none). */
     const char *hist;
+    /* The gateway knows this thread: its mic records an addition to it in any
+     * state but PROCESSING (OPEN = answer, others = add to the task / follow up). */
+    bool addable;
 } onurb_thread_t;
 #define ONURB_UI_THREAD_HIST_MAX 2047
 void onurb_ui_set_threads(const onurb_thread_t *t, int n);

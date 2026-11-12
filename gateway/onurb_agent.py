@@ -94,7 +94,13 @@ CODE_TOOLS = [
     "Bash(python3 -m py_compile:*)", "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)",
     "Bash(git add:*)", "Bash(git commit:*)",   # one local commit per task; push stays with the user
     "Bash(ls:*)",
+    "mcp__onurb__check_user_messages",         # additions the user records on the task's thread
 ]
+# Background/code tasks read what the user adds on their watch thread mid-run (the turn agent doesn't).
+MSG_TOOL = "mcp__onurb__check_user_messages"
+MSG_LINE = ("The user may add instructions or information while you work (recorded on the watch, on this "
+            "task's thread): call check_user_messages between major steps and once before finishing, and "
+            "follow what it returns.")
 CODE_NEVER = [
     f"Read(/{REPO}/firmware/sdkconfig)", f"Edit(/{REPO}/firmware/sdkconfig)", f"Write(/{REPO}/firmware/sdkconfig)",
     f"Read(/{REPO}/firmware/sdkconfig.old)", f"Read(/{Path.home()}/.config/**)",
@@ -176,6 +182,8 @@ Documents: anything the user should read in full (lists, trackers, reports, rese
 
 Shopping: shipping address {SHIP_TO_LINE}; per-purchase ceiling US$ {PURCHASE_MAX} (checkout total).
 
+{MSG_LINE}
+
 Finish with a line `SPOKEN: <one or two short sentences>` in the user's language summarizing the result for the watch speaker. Put the full result above it."""
 CODE_PROMPT = f"""You are Onurb's code worker. The user (Bruno) asked, by voice from their watch, for a change to
 Onurb itself. You may edit files in the Onurb repo ({REPO}) and build the watch firmware, without asking
@@ -201,13 +209,14 @@ Rules:
   `git add <file> <file>` then `git commit -m "onurb: <what changed> (voice request)"`. Never `git add -A`/`.`,
   never amend, push, reset or delete files; leave other uncommitted changes alone (they are someone else's).
 - If the request is unclear or risky (e.g. could brick the watch), do the safe part and say what is left.
+- {MSG_LINE}
 
 Finish with a line `SPOKEN: <one or two short sentences, in Portuguese>` saying what changed and whether it
 was built (e.g. "Pronto: a tela das conversas agora apaga em 1 minuto; o relógio atualiza na próxima
 checagem."). Put the details above it."""
 
 TURN_PROMPT = TURN_PROMPT.replace("{MAC_NOTE}", MAC_NOTE)
-TASK_PROMPT = TASK_PROMPT.replace("{MAC_NOTE}", MAC_NOTE)
+TASK_PROMPT = TASK_PROMPT.replace("{MAC_NOTE}", MAC_NOTE).replace("{MSG_LINE}", MSG_LINE)
 NOTION_LINE = (f'Create new pages as children of the user\'s "ONURB" page (page id {NOTION_HUB}); '
                "never put them in the workspace root. Don't delete, move or publicly share pages the user made."
                if NOTION_HUB else
@@ -320,6 +329,8 @@ def cancel_turn(turn):
     with LOCK:
         proc = TURN_PROCS.get(turn)
         CANCELLED_TURNS.add(turn)
+        for t in TASKS.values():         # a cancelled addition must not reach its task either
+            t["notes"] = [n for n in t.get("notes", []) if n[0] != turn]
     if proc and proc.poll() is None:
         _kill(proc)
         log(f"  turn {turn[:8]}: agent run stopped (cancelled on the watch)")
@@ -413,10 +424,33 @@ def run_turn(text, lang, turn, gateway, note="", thread=None, gesture=False):
         note = GESTURE_NOTE + note
     with LOCK:
         th = dict(THREADS[thread]) if thread in THREADS else None
+        # The watch's mic works on any thread (2026-11-12): a running task of this thread gets the
+        # addition directly (check_user_messages / resumed at its end); a finished one is context.
+        running, last = [], None
+        for tid, t in TASKS.items() if th else ():
+            if t.get("turn") != thread:
+                continue
+            if t["state"] == "running":
+                t.setdefault("notes", []).append((turn, text))
+                running.append(tid)
+            else:
+                last = (tid, t)
     if th:
         resume = th.get("sid")
+        ctx = ""
+        if running:
+            ctx = (f" Their message was passed to this thread's background task {', '.join(running)}, still "
+                   "running, which will take it into account: just acknowledge briefly unless they ask something "
+                   "else (e.g. to cancel it); don't start a duplicate task.")
+        elif last:
+            tid, t = last
+            ctx = (f" This thread's background task {tid} ({t['task'][:200]!r}) "
+                   + ("was cancelled." if t["state"] == "cancelled" else
+                      f"finished; its full result is in {t['out']}." if t.get("out") else "finished.")
+                   + " If they add to it or want more, continue from that context (a new background or code task"
+                   " with the full context if it needs long work).")
         prompt = (f"(The user is answering inside the thread of their earlier request "
-                  f"\"{th.get('heard', '')}\", where you replied \"{th.get('reply', '')}\".) {note}{text}")
+                  f"\"{th.get('heard', '')}\", where you replied \"{th.get('reply', '')}\".{ctx}) {note}{text}")
     else:
         resume = SESSION["id"] if time.time() - SESSION["t"] < SESSION_GAP_S else None
         prompt = f"{note}{text}" if note else text
@@ -439,6 +473,8 @@ def run_turn(text, lang, turn, gateway, note="", thread=None, gesture=False):
     reply, state = thread_state(reply, turn)
     if th:      # background tasks / Instinct answers from a thread reply report to that thread
         with LOCK:
+            if state == "done" and any(TASKS[tid]["state"] == "running" for tid in running):
+                state = "working"           # the task it was added to is still on it
             if turn in INSTINCT_WAIT:
                 THREAD_OF[turn] = thread
             for t in TASKS.values():
@@ -790,6 +826,41 @@ def cancel_task(tid):
     return "cancelled"
 
 
+def take_task_notes(turn):
+    """check_user_messages: what the user added on the task's watch thread since the last call.
+    turn is the task's MCP turn id (task-<id> / code-<id>)."""
+    tid = turn.split("-", 1)[-1]
+    with LOCK:
+        t = TASKS.get(tid)
+        if t is None or t["state"] != "running":
+            return []
+        notes, t["notes"] = [n[1] for n in t.get("notes", [])], []
+    if notes:
+        log(f"task {tid}: picked up {len(notes)} addition(s) from the watch")
+    return notes
+
+
+def _finish_with_notes(tid, text, sid, run):
+    """Additions that arrived after the task's last check_user_messages: resume its session with
+    them (a few rounds) so nothing the user added is lost. run(prompt, sid) -> (text, sid)."""
+    for _ in range(3):
+        notes = take_task_notes(f"x-{tid}")
+        if not notes:
+            break
+        if not sid:
+            log(f"task {tid}: {len(notes)} addition(s) dropped (no session to resume)")
+            break
+        prompt = ("The user added this from the watch while you were working; take it into account, finish "
+                  "the task and give the final result again (with the SPOKEN line):\n"
+                  + "\n".join(f"- {n}" for n in notes))
+        try:
+            text, sid = run(prompt, sid)
+        except Exception as e:  # noqa: BLE001 - keep the result we already have
+            log(f"task {tid}: resuming with the additions failed: {e}")
+            break
+    return text
+
+
 def start_task(task, turn, gateway, lang_hint="pt"):
     tid = uuid.uuid4().hex[:8]
     with LOCK:
@@ -804,13 +875,15 @@ def start_task(task, turn, gateway, lang_hint="pt"):
     def work():
         t0 = time.monotonic()
         log(f"task {tid}: started: {task[:120]!r}")
+        tools = (READ_TOOLS + [t for t in ONURB_TOOLS if t != "mcp__onurb__start_code_task"]
+                 + ["mcp__claude-in-chrome", MSG_TOOL])
+        run = lambda p, s=None: _claude(p, TASK_PROMPT, TASK_MODEL, tools, f"task-{tid}", gateway, resume=s,
+                                        timeout=TASK_TIMEOUT_S, chrome=True, on_start=started)
         try:
-            text, _ = _claude(task, TASK_PROMPT, TASK_MODEL,
-                              READ_TOOLS + [t for t in ONURB_TOOLS if t != "mcp__onurb__start_code_task"]
-                              + ["mcp__claude-in-chrome"],
-                              f"task-{tid}", gateway, timeout=TASK_TIMEOUT_S, chrome=True, on_start=started)
+            text, sid = run(task)
         except Exception as e:  # noqa: BLE001
-            text = f"SPOKEN: A tarefa em segundo plano falhou: {str(e)[:80]}"
+            text, sid = f"SPOKEN: A tarefa em segundo plano falhou: {str(e)[:80]}", None
+        text = _finish_with_notes(tid, text, sid, run)
         with LOCK:
             cancelled = TASKS[tid]["state"] == "cancelled"
             TASKS[tid]["proc"] = None
@@ -821,7 +894,9 @@ def start_task(task, turn, gateway, lang_hint="pt"):
             return
         out = RECEIVED / "tasks"
         out.mkdir(exist_ok=True)
-        (out / f"{time.strftime('%Y%m%d_%H%M%S')}_{tid}.md").write_text(f"# Task {tid}\n\n{task}\n\n---\n\n{text}\n")
+        f = out / f"{time.strftime('%Y%m%d_%H%M%S')}_{tid}.md"
+        f.write_text(f"# Task {tid}\n\n{task}\n\n---\n\n{text}\n")
+        TASKS[tid]["out"] = str(f.relative_to(RECEIVED))   # a later follow-up on its thread reads it
         m = re.search(r"SPOKEN:\s*(.+)", text, re.S)
         spoken = (m.group(1) if m else text).strip().splitlines()[0][:300]
         with LOCK:
@@ -858,11 +933,13 @@ def start_code_task(task, turn, gateway, lang_hint="pt"):
         t0 = time.monotonic()
         before = _code_mtimes()
         log(f"code task {tid}: started: {task[:120]!r}")
+        run = lambda p, s=None: _claude(p, CODE_PROMPT, TASK_MODEL, CODE_TOOLS, f"code-{tid}", gateway, resume=s,
+                                        timeout=CODE_TIMEOUT_S, on_start=started, never=CODE_NEVER, cwd=REPO)
         try:
-            text, _ = _claude(task, CODE_PROMPT, TASK_MODEL, CODE_TOOLS, f"code-{tid}", gateway,
-                              timeout=CODE_TIMEOUT_S, on_start=started, never=CODE_NEVER, cwd=REPO)
+            text, sid = run(task)
         except Exception as e:  # noqa: BLE001
-            text = f"SPOKEN: A mudança no Onurb falhou: {str(e)[:80]}"
+            text, sid = f"SPOKEN: A mudança no Onurb falhou: {str(e)[:80]}", None
+        text = _finish_with_notes(tid, text, sid, run)
         with LOCK:
             cancelled = TASKS[tid]["state"] == "cancelled"
             TASKS[tid]["proc"] = None
@@ -873,7 +950,9 @@ def start_code_task(task, turn, gateway, lang_hint="pt"):
             return
         out = RECEIVED / "tasks"
         out.mkdir(exist_ok=True)
-        (out / f"{time.strftime('%Y%m%d_%H%M%S')}_code_{tid}.md").write_text(f"# Code task {tid}\n\n{task}\n\n---\n\n{text}\n")
+        f = out / f"{time.strftime('%Y%m%d_%H%M%S')}_code_{tid}.md"
+        f.write_text(f"# Code task {tid}\n\n{task}\n\n---\n\n{text}\n")
+        TASKS[tid]["out"] = str(f.relative_to(RECEIVED))   # a later follow-up on its thread reads it
         m = re.search(r"SPOKEN:\s*(.+)", text, re.S)
         spoken = (m.group(1) if m else text).strip().splitlines()[0][:300]
         with LOCK:

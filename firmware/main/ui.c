@@ -1118,6 +1118,7 @@ static void wifi_icon_cb(lv_event_t *e)
 #define COLOR_TH_OPEN  0xFFD60A
 #define COLOR_TH_ERR   0xFF453A
 #define COLOR_TH_HEARD 0x2E2E2E
+#define COLOR_TH_ADD   0xBDBDBD /* mic on a thread not waiting for the user: add / follow up */
 
 typedef struct {
     uint32_t id;
@@ -1125,6 +1126,7 @@ typedef struct {
     char *heard; /* TH_TEXT bytes each, in PSRAM */
     char *reply;
     char *hist;  /* TH_HIST bytes, PSRAM: earlier exchanges ("heard\x1freply\x1e"...) */
+    bool addable; /* mic shown (see onurb_thread_t) */
 } th_item_t;
 
 static th_item_t s_th[TH_MAX];
@@ -1198,7 +1200,7 @@ static void copy_utf8(char *dst, const char *src, size_t cap)
 
 static uint32_t th_hash(const th_item_t *t)
 {
-    uint32_t h = 2166136261u ^ (uint32_t)t->state;
+    uint32_t h = 2166136261u ^ (uint32_t)t->state ^ (t->addable ? 0x100u : 0u);
 
     for (const char *p = t->heard; *p; p++) {
         h = (h ^ (uint8_t)*p) * 16777619u;
@@ -1236,20 +1238,28 @@ static void rail_update(void)
 /* Buttons under the thread body:
  *   OPEN            yellow mic (tap = answer) + small X (close the thread)
  *   OPEN, recording red mic (tap = stop and send) + small X (discard, back to OPEN)
+ *   WORKING/DONE/   gray mic (tap = add to this task / follow up); recording as above
+ *   ERROR, addable  (the X then only discards; these threads aren't closed by hand)
  *   PROCESSING      big X (cancel the request) */
+static bool th_can_add(const th_item_t *t)
+{
+    return t->addable && t->state != ONURB_THREAD_PROCESSING;
+}
+
 static void thv_controls(const th_item_t *t)
 {
     bool open = t->state == ONURB_THREAD_OPEN;
-    bool rec = open && s_mic_recording && s_mic_rec_id == t->id;
+    bool add = th_can_add(t);
+    bool rec = add && s_mic_recording && s_mic_rec_id == t->id;
     bool cancellable = t->state == ONURB_THREAD_PROCESSING;
 
-    lv_obj_set_hidden(s_thv_mic, !open);
-    lv_obj_set_hidden(s_thv_x, !open);
+    lv_obj_set_hidden(s_thv_mic, !add);
+    lv_obj_set_hidden(s_thv_x, !(open || rec));
     lv_obj_set_hidden(s_thv_cancel, !cancellable);
-    lv_obj_set_hidden(s_thv_mic_hint, !open && !cancellable);
-    if (open) {
-        lv_obj_set_style_bg_color(s_thv_mic, lv_color_hex(rec ? COLOR_TH_ERR : COLOR_TH_OPEN), 0);
-        lv_label_set_text(s_thv_mic_hint, rec ? "Listening... tap to send" : "Tap to answer");
+    lv_obj_set_hidden(s_thv_mic_hint, !add && !cancellable);
+    if (add) {
+        lv_obj_set_style_bg_color(s_thv_mic, lv_color_hex(rec ? COLOR_TH_ERR : open ? COLOR_TH_OPEN : COLOR_TH_ADD), 0);
+        lv_label_set_text(s_thv_mic_hint, rec ? "Listening... tap to send" : open ? "Tap to answer" : "Tap to add");
     } else if (cancellable) {
         lv_label_set_text(s_thv_mic_hint, s_th_cancel_sent == t->id ? "Cancelling..." : "Tap to cancel");
     }
@@ -1305,7 +1315,6 @@ static void thv_render(const th_item_t *t)
         [ONURB_THREAD_ERROR] = "Something went wrong",
     };
     bool busy = t->state == ONURB_THREAD_PROCESSING || t->state == ONURB_THREAD_WORKING;
-    bool open = t->state == ONURB_THREAD_OPEN;
     uint32_t h = th_hash(t);
 
     if (t->id == s_th_shown_id && h == s_th_shown_hash) {
@@ -1325,7 +1334,7 @@ static void thv_render(const th_item_t *t)
     lv_obj_set_hidden(s_thv_spin, !busy);
 
     lv_obj_set_height(s_thv_body, BSP_LCD_V_RES - TH_BODY_Y -
-                                   (open || t->state == ONURB_THREAD_PROCESSING ? TH_MIC + 64 : 36));
+                                   (th_can_add(t) || t->state == ONURB_THREAD_PROCESSING ? TH_MIC + 64 : 36));
     lv_obj_clean(s_thv_body);
     /* The whole exchange, oldest first: earlier turns (dimmer), then the latest. */
     static char seg[TH_TEXT];
@@ -1452,7 +1461,7 @@ static void mic_cb(lv_event_t *e)
 {
     int i = th_find(s_view_id);
 
-    if (s_swiped || i < 0 || s_th[i].state != ONURB_THREAD_OPEN) {
+    if (s_swiped || i < 0 || !th_can_add(&s_th[i])) {
         return;
     }
     if (s_mic_recording && s_mic_rec_id == s_view_id) {
@@ -1467,12 +1476,15 @@ static void th_x_cb(lv_event_t *e)
 {
     int i = th_find(s_view_id);
 
-    if (s_swiped || i < 0 || s_th[i].state != ONURB_THREAD_OPEN) {
+    if (s_swiped || i < 0 || !th_can_add(&s_th[i])) {
         return;
     }
     if (s_mic_recording && s_mic_rec_id == s_view_id) {
         s_rec_cancel = true;                  /* discard the answer, back to "Tap to answer" */
         return;
+    }
+    if (s_th[i].state != ONURB_THREAD_OPEN) {
+        return;                               /* only "waiting for you" threads are closed by hand */
     }
     s_th_cancel_taken = s_view_id;            /* close the thread (the main task removes it) */
 }
@@ -1680,6 +1692,7 @@ void onurb_ui_set_threads(const onurb_thread_t *t, int n)
         copy_utf8(s_th[k].heard, t[i].heard, TH_TEXT);
         copy_utf8(s_th[k].reply, t[i].reply, TH_TEXT);
         copy_utf8(s_th[k].hist, t[i].hist, TH_HIST);
+        s_th[k].addable = t[i].addable;
         k++;
     }
     s_th_n = k;

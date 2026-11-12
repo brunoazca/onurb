@@ -95,6 +95,13 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "check_user_messages",
+        "description": ("Background/code tasks only: what the user added (by voice, on this task's thread on "
+                        "the watch) since the last call: extra instructions, corrections or information. Call it "
+                        "between major steps and before finishing; follow what it returns."),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "cancel_background_task",
         "description": ("Stop a running background task (when the user says cancel/stop it). Its "
                         "result is dropped and nothing reaches the watch. Use the id from "
@@ -146,6 +153,10 @@ def run_tool(name, args):
     if name == "list_background_tasks":
         tasks = call_gateway("/internal/tasks", {}).get("tasks", [])
         return json.dumps(tasks, ensure_ascii=False) if tasks else "No background tasks since the gateway started."
+    if name == "check_user_messages":
+        msgs = call_gateway("/internal/tasks/messages", {"turn": TURN}).get("messages", [])
+        return ("The user added, from the watch:\n" + "\n".join(f"- {m}" for m in msgs)) if msgs else \
+            "No new messages from the user."
     if name == "cancel_background_task":
         r = call_gateway("/internal/tasks/cancel", {"task_id": args.get("task_id", "")})
         return f"Task {args.get('task_id')}: {r.get('result')}"
