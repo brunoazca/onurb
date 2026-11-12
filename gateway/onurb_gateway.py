@@ -647,7 +647,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps({"result": mark_false_trigger()}).encode())
         if self.path == "/internal/code":
             tid, err = agent.start_code_task(body.get("task", ""), turn, f"http://127.0.0.1:{cfg.port}")
-            return self._send(200, json.dumps({"task_id": tid, "error": err}).encode())
+            ahead = agent.code_ahead(tid) if tid else 0   # code tasks before it in line
+            return self._send(200, json.dumps({"task_id": tid, "error": err, "ahead": ahead}).encode())
         if self.path == "/internal/tasks":
             return self._send(200, json.dumps({"tasks": agent.list_tasks()}).encode())
         if self.path == "/internal/tasks/messages":   # what the user added on the task's watch thread

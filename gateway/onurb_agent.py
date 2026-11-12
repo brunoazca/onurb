@@ -110,13 +110,12 @@ CODE_NEVER = [
     "Bash(rm:*)", "WebSearch", "WebFetch", "Task", "NotebookEdit",
 ]
 CODE_TIMEOUT_S = 40 * 60
-# Parallel code tasks (2026-11-12, the user: "you should be able to run multiple jobs"): each one
-# works in its own git worktree + branch (code/<id>) under .worktrees/; when it finishes the
-# gateway rebases its commits onto main, fast-forwards main and rebuilds the firmware there (the
-# only image the watch is offered). Builds are serialized by tools/onurb_build.sh itself.
-WORKTREES = REPO / ".worktrees"
-CODE_SLOTS = threading.BoundedSemaphore(3)   # more than this wait their turn (queued, not refused)
-MERGE_LOCK = threading.Lock()                # one merge into main at a time
+# One code agent at a time, in the main repo (2026-11-12, the user: "deve ser um agente mais o
+# orchestrator que vai managing tudo"; replaces parallel tasks in git worktrees). The orchestrator
+# routes related requests to the running one (add_to_task); new ones wait in CODE_QUEUE (FIFO,
+# never refused) and start when the one ahead finishes or is cancelled.
+CODE_QUEUE = collections.deque()             # code task ids; [0] is the one running (CODE_TURN below)
+WORKTREES = REPO / ".worktrees"              # left over from the parallel tasks: cleaned up once
 RESTART_HOOK = None               # set by the gateway: restarts it after a code task changed its code
 NEVER = ["Bash(wacli send:*)", "Bash(wacli --read-only send:*)", "Bash(wacli messages send:*)",
          "Write", "Edit", "NotebookEdit", "Task",
@@ -165,7 +164,7 @@ What you can do:
 - Anything long (deep research, multi-step browsing, computer use): start_background_task with a complete description, then reply that you're on it.
 - "Foi falso positivo" / "alarme falso" / "não era com você" / "o gesto disparou sozinho": call mark_false_trigger (labels the last gesture as a false trigger for retraining), then reply very briefly.
 - Buying a physical item ("compra", "pede", "preciso de"): start_background_task telling it to use the `shopping` skill, with the item, quantity, specs and urgency the user gave. The task picks the best option and puts a purchase preview on the watch; only the user's Confirm buys it.
-- Changes to Onurb itself (the watch's screens/behavior/firmware, the gateway, your own prompts or tools): start_code_task with a complete spec of what the user wants (their words, the screen or behavior involved, edge cases). Don't ask for confirmation: the user pre-approved code changes to Onurb. Ask only if the request itself is ambiguous. Then say you're on it. Several code tasks run at once (each in its own copy of the repo, merged when done; beyond three they wait their turn).
+- Changes to Onurb itself (the watch's screens/behavior/firmware, the gateway, your own prompts or tools): start_code_task with a complete spec of what the user wants (their words, the screen or behavior involved, edge cases). Don't ask for confirmation: the user pre-approved code changes to Onurb. Ask only if the request itself is ambiguous. Then say you're on it. There is one code agent, working directly in the Onurb repo, one change at a time: you manage it. If it's busy, a related request goes to it with add_to_task; a separate one goes through start_code_task anyway and waits in line (it starts by itself when the current one ends), so say it's queued. Never refuse a change because the agent is busy.
 - You orchestrate your workers: before starting a background or code task, check list_background_tasks. If the new request belongs to one still running or queued (same change or research, a correction, a related detail), give it to that worker with add_to_task instead of starting another, and say so. Start a new task only for separate work.
 
 Names (speech-to-text often mangles them; map them back):
@@ -259,6 +258,7 @@ Finish with the order number, the final total and the delivery date, then
 
 # ------------------------------------------------------------------ state
 LOCK = threading.Lock()
+CODE_TURN = threading.Condition(LOCK)   # signalled when the code task at CODE_QUEUE[0] is done
 ACTIONS = {}                       # id -> dict (kind, jid, name, messages, avatar, state, turn)
 PROPOSED_BY_TURN = {}              # turn id -> latest action id
 INBOX = collections.deque()        # (text, lang, task_id) waiting for the watch
@@ -954,83 +954,58 @@ def _git(*args, cwd=None, timeout=120):
                           timeout=timeout, stdin=subprocess.DEVNULL)
 
 
-def _worktree_new(tid):
-    """A fresh worktree on branch code/<tid> from main, with the untracked build inputs copied in:
-    the firmware config (holds secrets: copied as a file, never read) and the ESP-IDF components."""
-    wt = WORKTREES / tid
-    WORKTREES.mkdir(exist_ok=True)
-    r = _git("worktree", "add", "-b", f"code/{tid}", str(wt), "main")
-    if r.returncode:
-        raise RuntimeError(f"git worktree add: {r.stderr.strip()[-200:]}")
-    fw = REPO / "firmware"
-    if (fw / "sdkconfig").is_file():
-        shutil.copy2(fw / "sdkconfig", wt / "firmware" / "sdkconfig")
-    if (fw / "managed_components").is_dir():
-        shutil.copytree(fw / "managed_components", wt / "firmware" / "managed_components", symlinks=True)
-    return wt
+_OLD_WORKTREES_CLEANED = False
 
 
-def _worktree_drop(tid, wt, keep_commits=True):
-    """Remove the task's worktree; its branch too unless it holds commits main doesn't have."""
-    if wt is None or not wt.exists():
+def _clean_old_worktrees():
+    """Once per gateway run: remove what the old parallel code tasks left (worktrees under .worktrees/
+    on code/<id> branches, and those branches). Only clean ones whose commits are all in main; any
+    with uncommitted edits or unmerged commits is kept and logged, never deleted."""
+    global _OLD_WORKTREES_CLEANED
+    if _OLD_WORKTREES_CLEANED:
         return
-    if keep_commits and _git("status", "--porcelain", cwd=wt).stdout.strip():
-        log(f"code task {tid}: uncommitted edits left in {wt.relative_to(REPO)} (kept)")
-        return
-    ahead = _git("rev-list", "--count", f"main..code/{tid}").stdout.strip()
-    if keep_commits and ahead not in ("", "0"):
-        log(f"code task {tid}: {ahead} unmerged commit(s) kept on branch code/{tid}")
-        return
-    _git("worktree", "remove", "--force", str(wt))
-    _git("branch", "-D", f"code/{tid}")
-
-
-def _merge_code(tid, wt):
-    """Bring the task's commits into main. Returns (status, files changed): status is "" (merged,
-    or nothing to merge), "conflict" (main changed the same lines meanwhile) or an error text."""
-    branch = f"code/{tid}"
-    with MERGE_LOCK:
-        if _git("status", "--porcelain", cwd=wt).stdout.strip():
-            return f"uncommitted edits left in .worktrees/{tid}", []
-        if _git("rev-list", "--count", f"main..{branch}").stdout.strip() in ("", "0"):
-            _worktree_drop(tid, wt)
-            return "", []
-        if _git("merge-base", "--is-ancestor", "main", branch).returncode != 0:
-            r = _git("rebase", "main", cwd=wt, timeout=300)
-            if r.returncode:
-                _git("rebase", "--abort", cwd=wt)
-                return "conflict", []
-        if _git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip() != "main":
-            return f"the repo is not on main; the change is on branch {branch}", []
-        files = _git("diff", "--name-only", f"main..{branch}").stdout.split()
-        r = _git("merge", "--ff-only", branch)
-        if r.returncode:   # e.g. someone's uncommitted edits in main touch the same files
-            return f"git merge: {r.stderr.strip()[-160:]} (the change is on branch {branch})", []
-        log(f"code task {tid}: merged into main ({len(files)} file(s))")
-        _worktree_drop(tid, wt)
-        return "", files
-
-
-def _publish_build():
-    """Rebuild the firmware in main (what the watch is offered), after a merge that touched it."""
+    _OLD_WORKTREES_CLEANED = True
     try:
-        r = subprocess.run([str(REPO / "tools" / "onurb_build.sh")], cwd=str(REPO), capture_output=True,
-                           text=True, timeout=60 * 60, stdin=subprocess.DEVNULL)
-        out = r.stdout + r.stderr
-    except subprocess.TimeoutExpired:
-        return False, "timeout"
-    return "BUILD OK" in out, out.strip()[-600:]
+        _git("worktree", "prune")
+        wts, path = {}, None
+        for line in _git("worktree", "list", "--porcelain").stdout.splitlines():
+            if line.startswith("worktree "):
+                path = Path(line[9:])
+            elif line.startswith("branch refs/heads/code/") and path and path.parent == WORKTREES:
+                wts[line[len("branch refs/heads/"):]] = path
+        for ref in _git("for-each-ref", "--format=%(refname:short)", "refs/heads/code/").stdout.split():
+            wt = wts.get(ref)
+            if wt and _git("status", "--porcelain", cwd=wt).stdout.strip():
+                log(f"old code worktree {wt.name}: uncommitted edits, kept")
+                continue
+            ahead = _git("rev-list", "--count", f"main..{ref}").stdout.strip()
+            if ahead != "0":
+                log(f"old code branch {ref}: {ahead or '?'} commit(s) not in main, kept")
+                continue
+            if wt:
+                _git("worktree", "remove", "--force", str(wt))
+            _git("branch", "-D", ref)
+            log(f"old code branch {ref} removed (already in main)")
+    except Exception as e:  # noqa: BLE001 - housekeeping only
+        log(f"old code worktrees cleanup failed: {e}")
+
+
+def code_ahead(tid):
+    """How many code tasks are before this one in line (0: it's the one running)."""
+    with LOCK:
+        return CODE_QUEUE.index(tid) if tid in CODE_QUEUE else 0
 
 
 def start_code_task(task, turn, gateway, lang_hint="pt"):
-    """Edit/build Onurb itself (see CODE_TOOLS), in its own worktree; several may run at once
-    (up to CODE_SLOTS, the rest wait). Mac only (the repo lives here)."""
+    """Edit/build Onurb itself (see CODE_TOOLS), directly in the repo. One code agent at a time: the
+    others wait in CODE_QUEUE and start in order. Mac only (the repo lives here)."""
     if HOST != "mac":
         return None, "code tasks run on the Mac (the repo and the firmware toolchain are there)"
     with LOCK:
         tid = uuid.uuid4().hex[:8]
         TASKS[tid] = {"task": task, "started": time.monotonic(), "state": "running", "proc": None,
-                      "turn": turn, "kind": "code", "queued": True}
+                      "turn": turn, "kind": "code", "queued": bool(CODE_QUEUE)}
+        CODE_QUEUE.append(tid)
     def started(proc):
         with LOCK:
             TASKS[tid]["proc"] = proc
@@ -1038,79 +1013,46 @@ def start_code_task(task, turn, gateway, lang_hint="pt"):
         if cancelled:
             _kill(proc)
     def work():
-        with CODE_SLOTS:
-            with LOCK:
-                TASKS[tid]["queued"] = False
-                go = TASKS[tid]["state"] == "running"
+        with CODE_TURN:
+            CODE_TURN.wait_for(lambda: CODE_QUEUE[0] == tid)
+            TASKS[tid]["queued"] = False
+            go = TASKS[tid]["state"] == "running"   # cancelled while queued: just pass the turn on
+        restart = False
+        try:
             if go:
-                _code_work(tid, task, gateway, lang_hint, started)
+                _clean_old_worktrees()
+                restart = _code_work(tid, task, gateway, lang_hint, started)
+        finally:
+            with CODE_TURN:   # the next one in line starts (also after a cancel or a crash)
+                CODE_QUEUE.remove(tid)
+                CODE_TURN.notify_all()
+        if restart:
+            _restart_after_code(tid)
     threading.Thread(target=work, daemon=True, name=f"code-{tid}").start()
     return tid, None
 
 
 def _code_work(tid, task, gateway, lang_hint, started):
+    """Run the code agent in the repo; its result goes to the task's watch thread. Returns True when
+    the gateway's own code changed (it must restart)."""
     t0 = time.monotonic()
     before = _code_mtimes()
     log(f"code task {tid}: started: {task[:120]!r}")
-    wt = None
+    run = lambda p, s=None: _claude(p, CODE_PROMPT, TASK_MODEL, CODE_TOOLS, f"code-{tid}", gateway, resume=s,
+                                    timeout=CODE_TIMEOUT_S, on_start=started, never=CODE_NEVER, cwd=REPO)
     try:
-        wt = _worktree_new(tid)
+        text, sid = run(task)
     except Exception as e:  # noqa: BLE001
-        text, sid, run = f"SPOKEN: Não consegui preparar a cópia do repositório: {str(e)[:80]}", None, None
-    if wt is not None:
-        system = CODE_PROMPT + f"""
-
-Your working copy for this task is the git worktree {wt} (branch code/{tid}), already your current
-directory: read, edit, build and commit there, never in {REPO} itself (other code tasks may be running
-at the same time, each in its own worktree). After you finish, the gateway rebases your commit onto
-main, merges it and rebuilds the firmware from main for the watch; a BUILD OK in the worktree checks
-your change only."""
-        tools = [t for t in CODE_TOOLS if not t.startswith(("Edit(", "Write("))] + [
-            f"Edit(/{wt}/**)", f"Write(/{wt}/**)", f"Bash({wt}/tools/onurb_build.sh)", "Bash(git merge main)"]
-        never = CODE_NEVER + [f"Read(/{wt}/firmware/sdkconfig)", f"Edit(/{wt}/firmware/sdkconfig)",
-                              f"Write(/{wt}/firmware/sdkconfig)"]
-        run = lambda p, s=None: _claude(p, system, TASK_MODEL, tools, f"code-{tid}", gateway, resume=s,
-                                        timeout=CODE_TIMEOUT_S, on_start=started, never=never, cwd=wt)
-        try:
-            text, sid = run(task)
-        except Exception as e:  # noqa: BLE001
-            text, sid = f"SPOKEN: A mudança no Onurb falhou: {str(e)[:80]}", None
-        text = _finish_with_notes(tid, text, sid, run)
+        text, sid = f"SPOKEN: A mudança no Onurb falhou: {str(e)[:80]}", None
+    text = _finish_with_notes(tid, text, sid, run)
     with LOCK:
         cancelled = TASKS[tid]["state"] == "cancelled"
         TASKS[tid]["proc"] = None
-    if cancelled:
-        _worktree_drop(tid, wt)   # commits it already made stay on their branch
-        log(f"code task {tid}: cancelled after {(time.monotonic() - t0) / 60:.1f} min")
-        return
-    # Into main. A conflict (another task changed the same lines first): the worker merges main
-    # into its branch and resolves it once; still conflicting, the branch is kept and the user told.
-    problem, files = ("", []) if wt is None else _merge_code(tid, wt)
-    if problem == "conflict" and sid:
-        log(f"code task {tid}: conflicts with main - asking the worker to merge main in")
-        try:
-            text, sid = run("Main changed while you worked (another code task was merged) and your commit "
-                            "conflicts with it. In your worktree run `git merge main`, resolve the conflicts "
-                            "keeping both changes, rebuild if firmware is involved, commit, and give the final "
-                            "result again (with the SPOKEN line).", sid)
-        except Exception as e:  # noqa: BLE001
-            log(f"code task {tid}: conflict round failed: {e}")
-        problem, files = _merge_code(tid, wt)
-    note = ""
-    if problem:
-        note = (f"Not merged into main: {problem if problem != 'conflict' else 'conflicts with main'}; "
-                f"the work is kept on branch code/{tid}.")
-        log(f"code task {tid}: {note}")
-    elif any(f.startswith("firmware/") for f in files):
-        ok, out = _publish_build()
-        log(f"code task {tid}: firmware rebuilt from main: {'OK' if ok else 'FAILED'}")
-        if not ok:
-            note = f"Merged into main, but the firmware build from main failed:\n{out}"
-    with LOCK:
-        if TASKS[tid]["state"] == "running":
+        if not cancelled:
             TASKS[tid]["state"] = "done"
-    if note:
-        text += f"\n\n---\n\nGateway: {note}"
+    if cancelled:
+        log(f"code task {tid}: cancelled after {(time.monotonic() - t0) / 60:.1f} min")
+        return False
     out = RECEIVED / "tasks"
     out.mkdir(exist_ok=True)
     f = out / f"{time.strftime('%Y%m%d_%H%M%S')}_code_{tid}.md"
@@ -1118,12 +1060,6 @@ your change only."""
     TASKS[tid]["out"] = str(f.relative_to(RECEIVED))   # a later follow-up on its thread reads it
     m = re.search(r"SPOKEN:\s*(.+)", text, re.S)
     spoken = (m.group(1) if m else text).strip().splitlines()[0][:300]
-    if problem:   # the worker's SPOKEN said "done"; the user must know it isn't in main
-        spoken = (f"A mudança ficou pronta mas não entrou na main "
-                  f"({'conflito' if problem == 'conflict' else 'erro no merge'}); está guardada no branch "
-                  f"code/{tid}. {OPEN_TAG}")
-    elif note:
-        spoken = f"A mudança entrou na main, mas a compilação final do relógio falhou. {OPEN_TAG}"
     with LOCK:
         thread = TASKS[tid].get("turn") or ""
     spoken, state = thread_state(spoken, thread)   # its [[OPEN]] / [[DONE]] decides
@@ -1132,22 +1068,26 @@ your change only."""
     with LOCK:
         INBOX.append((spoken, lang_hint, tid, thread, None))
     log(f"code task {tid}: done in {(time.monotonic() - t0) / 60:.1f} min -> watch inbox: {spoken!r}")
-    if _code_mtimes() != before and RESTART_HOOK:
-        # The gateway's own code changed: restart once the watch has the result (the inbox is in memory).
-        for _ in range(180):
-            with LOCK:
-                if not any(item[2] == tid for item in INBOX):
-                    break
-            time.sleep(1)
-        # A restart kills running tasks (they are the gateway's children): wait for them
-        # (lost a background task this way on 2026-11-11). Parallel code tasks included.
-        for _ in range(60 * 60):
-            with LOCK:
-                if not any(t["state"] == "running" for t in TASKS.values()):
-                    break
-            time.sleep(1)
-        log(f"code task {tid}: gateway code changed - restarting the gateway")
-        RESTART_HOOK()
+    return _code_mtimes() != before and RESTART_HOOK is not None
+
+
+def _restart_after_code(tid):
+    """The gateway's own code changed: restart once the watch has the result (the inbox is in memory)."""
+    for _ in range(180):
+        with LOCK:
+            if not any(item[2] == tid for item in INBOX):
+                break
+        time.sleep(1)
+    # A restart kills running tasks (they are the gateway's children) and forgets queued ones: wait
+    # for them (lost a background task this way on 2026-11-11). This task has already passed its
+    # turn on, so queued code tasks run meanwhile instead of waiting on it.
+    for _ in range(60 * 60):
+        with LOCK:
+            if not any(t["state"] == "running" for t in TASKS.values()):
+                break
+        time.sleep(1)
+    log(f"code task {tid}: gateway code changed - restarting the gateway")
+    RESTART_HOOK()
 
 
 def inbox_pop():

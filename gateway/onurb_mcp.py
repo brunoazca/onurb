@@ -83,8 +83,10 @@ TOOLS = [
             "Change Onurb itself: the watch firmware (screens, buttons, timeouts, behavior), the "
             "gateway, or your own prompts/tools. Pre-approved by the user: no confirmation needed. "
             "A code worker edits the Onurb repo, builds the firmware (the watch updates itself) and "
-            "the result reaches the watch when done. Several run in parallel (each in its own worktree, "
-            "merged into main when done); extra ones are queued, never refused. Describe the change "
+            "the result reaches the watch when done. There is one code agent, working directly in the "
+            "Onurb repo, one change at a time: while it's busy, a related request belongs to it "
+            "(add_to_task); a separate one started here waits in line and starts by itself when the "
+            "ones before it end (never refused). Describe the change "
             "completely: what the user wants, in their words, which screen/behavior, and edge cases."),
         "inputSchema": {"type": "object", "properties": {"task": {"type": "string"}},
                         "required": ["task"]},
@@ -161,6 +163,9 @@ def run_tool(name, args):
         r = call_gateway("/internal/code", {"task": args.get("task", ""), "turn": TURN})
         if r.get("error"):
             return "Not started: " + r["error"]
+        if r.get("ahead"):
+            return (f"Queued (code task {r.get('task_id')}, {r['ahead']} ahead of it): it starts by itself when "
+                    "the code agent is free. The result will reach the user's watch when done.")
         return f"Started (code task {r.get('task_id')}). The result will reach the user's watch when done."
     if name == "list_background_tasks":
         tasks = call_gateway("/internal/tasks", {}).get("tasks", [])
