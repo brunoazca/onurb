@@ -135,6 +135,9 @@ uint32_t onurb_ui_thread_reply_taken(void);
 uint32_t onurb_ui_thread_cancel_taken(void);
 /* Thread open right now, 0 = main view. */
 uint32_t onurb_ui_thread_view(void);
+/* Open thread `id` (it must already be in the list). false = not now: unknown id, or the
+ * WhatsApp/purchase preview or the Wi-Fi picker is on screen. */
+bool onurb_ui_open_thread(uint32_t id);
 /* While answering a thread by voice: the red mic was tapped (stop and send) or
  * the X beside it (discard, back to "Tap to answer"). Latched; read clears. */
 bool onurb_ui_rec_stop_taken(void);

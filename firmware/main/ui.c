@@ -1735,6 +1735,21 @@ uint32_t onurb_ui_thread_view(void)
     return s_view_id;
 }
 
+bool onurb_ui_open_thread(uint32_t id)
+{
+    if (!s_ready) {
+        return false;
+    }
+    bsp_display_lock(0);
+    /* Not over the WhatsApp/purchase preview or the Wi-Fi picker: the caller retries later. */
+    bool ok = th_find(id) >= 0 && s_wp == NULL && (s_wa == NULL || lv_obj_is_hidden(s_wa));
+    if (ok && s_view_id != id) {
+        th_go(id, +1);
+    }
+    bsp_display_unlock();
+    return ok;
+}
+
 bool onurb_ui_rec_stop_taken(void)
 {
     bool v = s_rec_stop;

@@ -562,9 +562,11 @@ static void threads_tick(int64_t now)
         }
     }
     for (int i = s_nthreads - 1; i >= 0; i--) {
+        /* On screen (lit): the user may add to it. A dark screen doesn't keep it: replies now open
+         * their thread by themselves, so a done one would otherwise stay forever. */
         if ((s_threads[i].state == TH_DONE || s_threads[i].state == TH_ERROR) &&
             now - s_threads[i].done_at > THREAD_DONE_TTL &&
-            !(ONURB_UI_HAS_THREADS && onurb_ui_thread_view() == s_threads[i].id)) {   /* on screen: the user may add to it */
+            !(ONURB_UI_HAS_THREADS && onurb_ui_thread_view() == s_threads[i].id && onurb_screen_is_on())) {
             thread_remove(s_threads[i].id);
         }
     }
@@ -860,6 +862,31 @@ static bool cancel_request(uint32_t thread)
     return true;
 }
 
+/* Bruno (2026-11-12): a reply being played opens its thread, so the screen shows what is being
+ * said. Never over a WhatsApp/purchase preview or the gesture red X: the thread opens once those
+ * are gone (within OPEN_DEFER_US, so a late open doesn't yank the user away from something else).
+ * Recording runs on the main task, so this can't fire mid-recording. Main task only. */
+#define OPEN_DEFER_US (2LL * 60 * 1000000)
+static uint32_t s_open_thread;
+static int64_t s_open_until_us;
+
+static void open_thread_tick(int64_t now)
+{
+#if ONURB_UI_HAS_THREADS
+    if (s_open_thread == 0 || s_ui_mode == UI_ACTION || s_ui_mode == UI_FEEDBACK || s_action.json) {
+        if (s_open_thread && now > s_open_until_us) {
+            s_open_thread = 0;
+        }
+        return;
+    }
+    if (thread_find(s_open_thread) == NULL || onurb_ui_open_thread(s_open_thread) || now > s_open_until_us) {
+        s_open_thread = 0;
+    }
+#else
+    (void)now;
+#endif
+}
+
 /* Present the oldest finished request (keeps request order). */
 static void present_next(void)
 {
@@ -918,6 +945,13 @@ static void present_next(void)
 #if ONURB_UI_HAS_REPLY && !ONURB_UI_HAS_THREADS
         onurb_ui_set_reply(job->text);           /* pushed on top of the history */
 #endif
+        if (th) {                                /* show its thread while it plays */
+            int64_t t = esp_timer_get_time();
+            s_open_thread = th->id;
+            s_open_until_us = t + OPEN_DEFER_US;
+            threads_tick(t);                     /* the UI gets the new reply first */
+            open_thread_tick(t);
+        }
         if (!play_reply(job->reply, job->reply_len)) {
             ESP_LOGE(TAG, "request #%d: reply format unsupported", job->seq);
         }
@@ -1158,6 +1192,7 @@ static void pipeline_tick(void)
         s_ui_mode = UI_IDLE;
     }
     threads_tick(now);
+    open_thread_tick(now);                       /* a deferred open (preview / red X was up) */
     gesture_queue_tick(now);
 #if ONURB_UI_HAS_THREAD_CANCEL
     uint32_t cancel_th = onurb_ui_thread_cancel_taken();
@@ -1438,6 +1473,7 @@ static void record_and_queue(stop_mode_t mode, const char *edit_of)
     strlcpy(s_rec_trigger, s_reply_to ? "thread" : mode == STOP_ON_MOTION ? "gesture" : "button",
             sizeof(s_rec_trigger));
     fb_discard();                                /* a new request ends the feedback window */
+    s_open_thread = 0;                           /* nor a deferred thread open after it */
     s_last_job = NULL;
     if (!wait_upload_free()) {
         notice("Busy - try again", ONURB_UI_COLOR_ERROR, 2000);
