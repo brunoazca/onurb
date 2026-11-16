@@ -389,6 +389,7 @@ static struct {
     uint8_t *avatar;
     int avatar_px;
     bool purchase;                               /* Confirm buys (checkout task) instead of sending */
+    bool scheduled;                              /* Confirm schedules the send (shows "when") */
     int64_t until_us;
 } s_action;
 static volatile bool s_inbox_busy;
@@ -993,9 +994,11 @@ static void action_show(void)
         onurb_ui_show_purchase(name ? name : "?", (const uint16_t *)s_action.avatar, s_action.avatar_px, msgs, n);
     } else {
         onurb_ui_show_whatsapp(name ? name : "?", s_action.avatar_px == 96 ? (const uint16_t *)s_action.avatar : NULL,
-                               msgs, n);
+                               msgs, n, cJSON_GetStringValue(cJSON_GetObjectItem(j, "when")));
     }
     s_action.purchase = kind && strcmp(kind, "purchase") == 0;
+    const char *when = cJSON_GetStringValue(cJSON_GetObjectItem(j, "when"));
+    s_action.scheduled = when && when[0];
     cJSON_Delete(j);
     s_ui_mode = UI_ACTION;
 #endif
@@ -1069,14 +1072,16 @@ static void action_tick(int64_t now)
     }
     if (taken == 1) {
         bool buy = s_action.purchase;
-        onurb_ui_set_status(buy ? "Ordering..." : "Sending...", ONURB_UI_COLOR_BUSY);
+        bool later = s_action.scheduled;
+        onurb_ui_set_status(buy ? "Ordering..." : later ? "Scheduling..." : "Sending...", ONURB_UI_COLOR_BUSY);
         bool ok = onurb_action_post(s_action.id, "confirm") == ESP_OK;
         ESP_LOGI(TAG, "%s %s: %s", buy ? "purchase" : "WhatsApp", s_action.id,
                  ok ? "confirmed on the watch" : "confirm FAILED");
         action_clear();
         onurb_haptic(ok ? ONURB_HAPTIC_DOUBLE : ONURB_HAPTIC_ERROR);
         /* a purchase: the checkout runs in the background; its result arrives in the inbox */
-        notice(ok ? (buy ? "Buying - result soon" : "Sent") : (buy ? "Order failed" : "Send failed"),
+        notice(ok ? (buy ? "Buying - result soon" : later ? "Scheduled" : "Sent")
+                  : (buy ? "Order failed" : later ? "Not scheduled" : "Send failed"),
                ok ? ONURB_UI_COLOR_BUSY : ONURB_UI_COLOR_ERROR, buy ? 2500 : 1500);
     } else if (taken == 2 || now >= s_action.until_us) {
         bool buy = s_action.purchase;

@@ -44,8 +44,23 @@ TOOLS = [
             "order, written as the user would write them."),
         "inputSchema": {"type": "object",
                         "properties": {"to": {"type": "string"},
-                                       "messages": {"type": "array", "items": {"type": "string"}}},
+                                       "messages": {"type": "array", "items": {"type": "string"}},
+                                       "send_at": {"type": "string", "description": (
+                                           "Optional: send later instead of on Confirm. The user's local "
+                                           "time, ISO 8601 (e.g. 2026-11-17T09:00). The watch shows it; "
+                                           "after Confirm the server sends exactly these messages then.")}},
                         "required": ["to", "messages"]},
+    },
+    {
+        "name": "list_scheduled",
+        "description": "List WhatsApp messages scheduled to be sent later (confirmed, not sent yet).",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "cancel_scheduled",
+        "description": ("Cancel a scheduled WhatsApp message before it goes out (id from list_scheduled). "
+                        "Only when the user asked to cancel it."),
+        "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
     },
     {
         "name": "start_background_task",
@@ -139,14 +154,26 @@ def run_tool(name, args):
         return r.get("reply", "")
     if name == "propose_whatsapp":
         r = call_gateway("/internal/propose_whatsapp",
-                         {"to": args.get("to", ""), "messages": args.get("messages", []), "turn": TURN})
+                         {"to": args.get("to", ""), "messages": args.get("messages", []),
+                          "send_at": args.get("send_at") or None, "turn": TURN})
         if r.get("candidates"):
             return "Several contacts match; ask the user which one: " + "; ".join(r["candidates"])
         if r.get("error"):
             return "Not proposed: " + r["error"]
+        when = f" It will be sent at the scheduled time ({r['when']}) after the Confirm." if r.get("when") else ""
         return (f"Preview sent to the watch for {r['name']} ({len(args.get('messages', []))} "
-                "message(s)). Nothing is sent until the user taps Confirm. Tell the user to check "
-                "the watch; do not try to send it any other way.")
+                "message(s)). Nothing is sent until the user taps Confirm." + when + " Tell the user to "
+                "check the watch; do not try to send it any other way.")
+    if name == "list_scheduled":
+        r = call_gateway("/internal/scheduled", {})
+        if r.get("error"):
+            return "Couldn't read the schedule: " + r["error"]
+        return json.dumps(r["items"], ensure_ascii=False) if r.get("items") else "Nothing scheduled."
+    if name == "cancel_scheduled":
+        r = call_gateway("/internal/scheduled/cancel", {"id": args.get("id", "")})
+        if r.get("error"):
+            return "Not cancelled: " + r["error"]
+        return "Cancelled; it will not be sent." if r.get("cancelled") else "Not found (already sent or cancelled)."
     if name == "start_background_task":
         r = call_gateway("/internal/background", {"task": args.get("task", ""), "turn": TURN})
         return f"Started (task {r.get('task_id')}). The result will reach the user's watch when done."

@@ -12,6 +12,7 @@ Stdlib only. Personal data (contacts, avatars, task results) stays under
 gateway/received/ (gitignored).
 """
 import collections
+import datetime as dt
 import json
 import os
 import re
@@ -40,7 +41,7 @@ PRODUCT_PX = 120                   # product photo on the watch's purchase previ
 
 # Private settings, never in the repo: shopping.env (gateway/skills/shopping: ship-to, ceiling)
 # and notion.env (ONURB_NOTION_HUB: the id of the user's "ONURB" Notion page).
-for _env in ("shopping.env", "notion.env"):
+for _env in ("shopping.env", "notion.env", "schedule.env"):
     _f = Path.home() / ".config" / "onurb" / _env
     if not _f.exists():
         continue
@@ -78,6 +79,7 @@ READ_TOOLS = [
     "mcp__claude_ai_Notion",
 ]
 ONURB_TOOLS = ["mcp__onurb__route_to_instinct", "mcp__onurb__propose_whatsapp",
+               "mcp__onurb__list_scheduled", "mcp__onurb__cancel_scheduled",
                "mcp__onurb__start_background_task", "mcp__onurb__list_background_tasks",
                "mcp__onurb__cancel_background_task", "mcp__onurb__start_code_task",
                "mcp__onurb__propose_purchase", "mcp__onurb__mark_false_trigger", "mcp__onurb__add_to_task"]
@@ -158,6 +160,7 @@ Reply rules:
 
 What you can do:
 - Read WhatsApp with `wacli --read-only ...` (chats list, messages list --chat <jid>, messages search, contacts search). You can never send with wacli.
+- To send a WhatsApp message LATER ("manda amanhã às 9h", "lembra o Zig sexta de manhã"): call propose_whatsapp with send_at (the user's local time, ISO 8601, e.g. 2026-11-17T09:00; it is now {NOW_LOCAL}). The watch shows the time; on Confirm the server sends it then, even with the Mac off. Vague times: pick a sensible one ("de manhã" = 09:00) and say it. "O que tem agendado?" = list_scheduled; to cancel one, cancel_scheduled with its id (say who/when, never the id).
 - To message someone on WhatsApp, call propose_whatsapp: the watch shows a preview and the user confirms there. Keep the user's voice; split into natural separate bubbles. No emoji (the watch can't show them).
 - Email of any kind (reading, searching, replying, sending) goes to Instinct via route_to_instinct: Instinct owns the user's mailbox.
 - People in the user's network (Blackbone My Network, their LinkedIn connections): mynetwork search_people / list_by_company / list_by_tag (investor, founder, stealth) / get_person / network_overview. Say names and roles, never ids.
@@ -306,6 +309,9 @@ def _claude(prompt, system, model, tools, turn, gateway, resume=None, timeout=TU
             on_start=None, never=None, cwd=None):
     """Run claude -p; returns (result text, session id). on_start(proc) lets a caller cancel it."""
     mcp = _mcp_config(turn, gateway)
+    if "{NOW_LOCAL}" in system:      # scheduled WhatsApp: the agent needs the user's clock
+        from zoneinfo import ZoneInfo
+        system = system.replace("{NOW_LOCAL}", dt.datetime.now(ZoneInfo(_user_tz())).strftime("%A %Y-%m-%d %H:%M %Z"))
     args = ["claude", "-p", prompt, "--output-format", "json", "--model", model,
             "--append-system-prompt", system, "--mcp-config", mcp,
             "--allowedTools", *tools, "--disallowedTools", *(never or NEVER), *SANDBOX]
@@ -653,11 +659,52 @@ def fetch_avatar(jid):
 EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200D\U0001F1E6-\U0001F1FF]")
 
 
-def propose_whatsapp(to, messages, turn):
+def _user_tz():
+    """The user's time zone: ONURB_TZ, else the Mac's own zone (it follows the user when they travel).
+    The server (UTC-ish, fixed) uses the zone the Mac last sent along with a scheduled message."""
+    if os.environ.get("ONURB_TZ"):
+        return os.environ["ONURB_TZ"]
+    if HOST == "server":
+        f = RECEIVED / "user_tz"
+        return f.read_text().strip() if f.exists() else "America/Los_Angeles"
+    link = os.path.realpath("/etc/localtime")
+    return link.split("zoneinfo/", 1)[1] if "zoneinfo/" in link else "America/Los_Angeles"
+
+
+WEEKDAY_PT = ["seg", "ter", "qua", "qui", "sex", "sáb", "dom"]
+
+
+def _parse_send_at(s):
+    """ISO 8601 local time ("2026-11-17T09:00", offset optional; no offset = the user's zone)
+    -> (epoch, "Envia ter 17/11 09:00") or raises ValueError with a reason for the agent."""
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(_user_tz())
+    try:
+        t = dt.datetime.fromisoformat(str(s).strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError("send_at must be ISO 8601, e.g. 2026-11-17T09:00 (the user's local time)") from None
+    t = t.replace(tzinfo=tz) if t.tzinfo is None else t
+    at = t.timestamp()
+    now = time.time()
+    if at < now + 60:
+        raise ValueError("send_at is in the past or less than a minute away; send now instead (omit send_at)")
+    if at > now + 60 * 86400:
+        raise ValueError("send_at is more than 60 days away")
+    lt = t.astimezone(tz)
+    return at, f"Envia {WEEKDAY_PT[lt.weekday()]} {lt:%d/%m %H:%M}"
+
+
+def propose_whatsapp(to, messages, turn, send_at=None):
     messages = [re.sub(r"\s{2,}", " ", EMOJI_RE.sub("", m)).strip() for m in messages if m]
     messages = [m for m in messages if m][:8]
     if not messages:
         return {"error": "no message text"}
+    at = when = None
+    if send_at:
+        try:
+            at, when = _parse_send_at(send_at)
+        except ValueError as e:
+            return {"error": str(e)}
     try:
         jid, name = resolve_contact(to)
     except LookupError as e:
@@ -665,12 +712,14 @@ def propose_whatsapp(to, messages, turn):
         return {"candidates": cands} if cands else {"error": f"no WhatsApp contact matches '{to}'"}
     aid = uuid.uuid4().hex[:12]
     action = {"id": aid, "kind": "whatsapp", "jid": jid, "name": name, "messages": messages,
-              "avatar": fetch_avatar(jid), "state": "pending", "turn": turn, "t": time.time()}
+              "avatar": fetch_avatar(jid), "state": "pending", "turn": turn, "t": time.time(),
+              "send_at": at, "when": when}
     with LOCK:
         ACTIONS[aid] = action
         PROPOSED_BY_TURN[turn] = aid
-    log(f"  WhatsApp proposal {aid} -> {name}: {len(messages)} message(s), avatar {'yes' if action['avatar'] else 'no'}")
-    return {"action_id": aid, "name": name}
+    log(f"  WhatsApp proposal {aid} -> {name}: {len(messages)} message(s), avatar {'yes' if action['avatar'] else 'no'}"
+        + (f", scheduled: {when}" if when else ""))
+    return {"action_id": aid, "name": name, "when": when}
 
 
 def _image_to_rgb565(url, px):
@@ -786,6 +835,17 @@ def confirm(aid):
         log(f"  action {aid}: purchase CONFIRMED on the watch ({a['name']!r}, US$ {a['total']:.2f})")
         _checkout(aid)
         return True, "ordering"
+    if a.get("send_at"):
+        r = schedule_call("add", {"jid": a["jid"], "name": a["name"], "messages": a["messages"],
+                                  "send_at": a["send_at"], "when": a["when"], "turn": a.get("turn") or "",
+                                  "tz": _user_tz()})
+        if not r.get("id"):
+            a["state"] = "failed"
+            log(f"  action {aid}: scheduling FAILED: {r.get('error')}")
+            return False, str(r.get("error"))[:200]
+        a["state"], a["schedule_id"] = "scheduled", r["id"]
+        log(f"  action {aid}: scheduled on the server as {r['id']} ({a['when']}) for {a['name']} (confirmed on the watch)")
+        return True, "scheduled"
     for m in a["messages"]:
         r = subprocess.run(["wacli", "send", "text", "--to", a["jid"], "--message", m],
                            capture_output=True, text=True, timeout=60)
@@ -795,6 +855,50 @@ def confirm(aid):
     a["state"] = "sent"
     log(f"  action {aid}: sent {len(a['messages'])} message(s) to {a['name']} (confirmed on the watch)")
     return True, "sent"
+
+
+def schedule_call(cmd, item=None, arg=None):
+    """The scheduled-message queue lives on the server (gateway/onurb_schedule.py). On the server:
+    call it directly. On the Mac: SSH with a key the server restricts to that script (docs/SERVER.md)."""
+    if HOST == "server":
+        import onurb_schedule as sch
+        if cmd == "add":
+            return sch.add(item)
+        if cmd == "list":
+            return {"items": sch.list_pending()}
+        return {"cancelled": sch.cancel(arg)}
+    host = os.environ.get("ONURB_SCHEDULE_SSH", "")
+    key = Path.home() / ".config" / "onurb" / "schedule_key"
+    if not host or not key.exists():
+        return {"error": "scheduling isn't set up on this Mac (no server SSH key)"}
+    try:
+        r = subprocess.run(["ssh", "-i", str(key), "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                            "-o", "IdentitiesOnly=yes", host, cmd] + ([arg] if arg else []),
+                           input=json.dumps(item) if item else "", capture_output=True, text=True, timeout=40)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"server unreachable ({str(e)[:80]})"}
+
+
+def list_scheduled():
+    r = schedule_call("list")
+    if "error" in r:
+        return r
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(_user_tz())
+    return {"items": [{"id": i["id"], "to": i["name"], "messages": i["messages"],
+                       "send_at_local": dt.datetime.fromtimestamp(i["send_at"], tz).strftime("%a %Y-%m-%d %H:%M")}
+                      for i in sorted(r["items"], key=lambda i: i["send_at"])]}
+
+
+def cancel_scheduled(sid):
+    sid = re.sub(r"[^0-9a-f]", "", str(sid))[:8]
+    if not sid:
+        return {"error": "id required"}
+    r = schedule_call("cancel", arg=sid)
+    if r.get("cancelled"):
+        log(f"  scheduled {sid}: cancelled by the user (voice)")
+    return r
 
 
 def cancel(aid):
@@ -813,7 +917,8 @@ def action_public(aid):
     if a is None:
         return None
     return {"id": a["id"], "kind": a["kind"], "name": a["name"], "messages": a["messages"],
-            "state": a["state"], "avatar": bool(a["avatar"]), "avatar_px": a.get("avatar_px", AVATAR_PX)}
+            "state": a["state"], "avatar": bool(a["avatar"]), "avatar_px": a.get("avatar_px", AVATAR_PX),
+            **({"when": a["when"]} if a.get("when") else {})}
 
 
 # ------------------------------------------------------------------ background tasks

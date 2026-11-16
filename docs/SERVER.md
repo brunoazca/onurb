@@ -27,6 +27,24 @@ Remaining (user):
 3. In the server Chrome (VNC): install Claude in Chrome, sign in, log into the sites that matter.
 4. herdr on the Mac from the server: needs Remote Login on the Mac + the server's key.
 
+## Scheduled WhatsApp
+
+"Manda pro X amanhã às 9h: ...": the agent calls `propose_whatsapp` with `send_at` (the user's
+local time). The watch preview shows "Envia ter 17/11 09:00"; Confirm hands the message to the
+server, which sends exactly that text at that time (`gateway/onurb_schedule.py`, queue in
+`received/scheduled.json`), even with the Mac off. Only the server keeps the queue, so nothing is
+sent twice.
+
+- Mac -> server: SSH as `onurb` with `~/.config/onurb/schedule_key`; the server's
+  `authorized_keys` pins that key to `onurb_schedule.py` (`command=`, no pty/forwarding), so it
+  can only `add`, `list` or `cancel <id>`. Host in `~/.config/onurb/schedule.env`.
+- The server's own notices (sent / failed) reach the watch first through its `/v1/inbox`,
+  before the request is proxied to the Mac.
+- A failed send retries for 10 min, then the watch is told. If the server was down at the send
+  time, the message is not sent late; the watch asks instead.
+- Time zone: the Mac's own zone (follows the user); the server uses the zone the Mac last sent.
+- Voice: "o que tem agendado?" (`list_scheduled`), "cancela a mensagem pro X" (`cancel_scheduled`).
+
 ## Target
 
 ```

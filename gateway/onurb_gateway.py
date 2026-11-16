@@ -636,8 +636,12 @@ class Handler(BaseHTTPRequestHandler):
             follow_instinct(turn, cfg.instinct_jid, sent_at, f"http://127.0.0.1:{cfg.port}")
             return self._send(200, json.dumps({"reply": reply}).encode())
         if self.path == "/internal/propose_whatsapp":
-            r = agent.propose_whatsapp(body.get("to", ""), body.get("messages") or [], turn)
+            r = agent.propose_whatsapp(body.get("to", ""), body.get("messages") or [], turn, body.get("send_at"))
             return self._send(200, json.dumps(r).encode())
+        if self.path == "/internal/scheduled":
+            return self._send(200, json.dumps(agent.list_scheduled(), ensure_ascii=False).encode())
+        if self.path == "/internal/scheduled/cancel":
+            return self._send(200, json.dumps(agent.cancel_scheduled(body.get("id", ""))).encode())
         if self.path == "/internal/background":
             tid = agent.start_task(body.get("task", ""), turn, f"http://127.0.0.1:{cfg.port}")
             return self._send(200, json.dumps({"task_id": tid}).encode())
@@ -769,6 +773,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/healthz", "/v1/health"):
             return self._send(200, b'{"ok":true}')
+        if self.path == "/v1/inbox" and UPSTREAM and agent.INBOX:
+            return self._inbox()          # this server's own notices (scheduled sends) go first
         if self._proxied("GET"):
             return
         if self.path in ("/v1/firmware/info", "/v1/firmware/image"):
@@ -990,6 +996,13 @@ def main():
     agent.RESTART_HOOK = restart_self
     if UPSTREAM:
         threading.Thread(target=watch_upstream, daemon=True, name="upstream").start()
+    if agent.HOST == "server" and cfg.brain == "onurb":   # scheduled WhatsApp: only the server sends them
+        import onurb_schedule
+        def _sched_notice(text, rec):
+            with agent.LOCK:
+                agent.INBOX.append((text, "pt", f"sched-{rec['id']}", "", None))
+        onurb_schedule.run_scheduler(_sched_notice, log)
+        log("scheduled WhatsApp: scheduler running")
     srv = ThreadingHTTPServer((cfg.host, cfg.port), Handler)
     srv.cfg = cfg
     log(f"Onurb gateway on {cfg.host}:{cfg.port}, brain={cfg.brain}, play_local={cfg.play_local}")

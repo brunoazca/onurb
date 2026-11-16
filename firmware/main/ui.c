@@ -505,7 +505,8 @@ static void wa_hide(void)
     }
 }
 
-void onurb_ui_show_whatsapp(const char *name, const uint16_t *avatar_rgb565, const char *const *msgs, int n)
+void onurb_ui_show_whatsapp(const char *name, const uint16_t *avatar_rgb565, const char *const *msgs, int n,
+                            const char *when)
 {
     char initial[5];
 
@@ -523,6 +524,15 @@ void onurb_ui_show_whatsapp(const char *name, const uint16_t *avatar_rgb565, con
     lv_label_set_text(s_wa_initial, initial);
     wa_set_avatar(avatar_rgb565);
     lv_obj_clean(s_wa_list);
+    if (when != NULL && when[0] != '\0') {          /* scheduled send: "Envia ter 17/11 09:00" */
+        lv_obj_t *w = lv_label_create(s_wa_list);
+        lv_obj_set_width(w, WA_LIST_W - 20);
+        lv_label_set_long_mode(w, LV_LABEL_LONG_MODE_WRAP);
+        lv_obj_set_style_text_align(w, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(w, &onurb_font_reply_20, 0);
+        lv_obj_set_style_text_color(w, lv_color_hex(COLOR_WIFI_WAIT), 0);
+        lv_label_set_text(w, when);
+    }
     for (int i = 0; i < n; i++) {
         if (msgs[i] != NULL && msgs[i][0] != '\0') {
             wa_bubble(msgs[i]);
