@@ -1,50 +1,73 @@
 # Onurb
 
-**Onurb** is a wrist-worn, push-to-talk voice companion: the complete watch system built on the
-[Waveshare ESP32-S3-Touch-AMOLED-2.06](https://github.com/waveshareteam/ESP32-S3-Touch-AMOLED-2.06) smartwatch dev kit.
-It covers the firmware, the audio pipeline, Wi-Fi connectivity, the turn API, triggers, power behaviour, and a mock backend for testing.
+**Onurb** is a personal voice assistant on the wrist: firmware for the
+[Waveshare ESP32-S3-Touch-AMOLED-2.06](https://github.com/waveshareteam/ESP32-S3-Touch-AMOLED-2.06) smartwatch,
+a gateway, and a Claude Code agent that acts on the user's WhatsApp, calendar, notes, browser,
+terminal agents and this repo itself.
 
-Press the BOOT button (or, optionally, perform your own trained wrist gesture). Onurb records your voice, sends it over Wi-Fi to a configurable API, and plays back the spoken reply. Audio is strictly record **then** play.
+Raise the watch to your mouth (a trained wrist gesture) or press the button, speak, and the
+answer comes back on the screen. Anything that leaves on your behalf (a WhatsApp message, a
+purchase) is shown on the watch first and goes out only after you tap **Confirm**.
 
-> **Status: specification stage (M0).** The hardware has not been purchased yet. Nothing here has run on a real watch.
-> See [`docs/SPEC.md`](docs/SPEC.md) for the full development specification of the watch, including what can be verified with compile/mock tests and which physical acceptance tests are still outstanding.
-> See [`docs/AGENT.md`](docs/AGENT.md) for the assistant backend: what answers when the watch opens a chat, how it's deployed, and how it's secured.
-> [`brief.md`](brief.md) is the original task brief the project started from.
+> **Status:** in daily use on the real watch. Hardware, firmware and the agent run every day;
+> the shopping flow is built but not yet tested end to end.
 
-## System at a glance
+![Watch screens](docs/onurb_screens.png)
 
-| Part | What it does |
+## What it does
+
+| Area | What happens |
 |---|---|
-| Firmware (ESP-IDF v5.5.5) | State machine, single audio-resource manager on the pinned Waveshare BSP (24 kHz voice profile), Wi-Fi with auto-reconnect, Turn API client |
-| Triggers | BOOT button (hold-to-talk or tap-toggle); optional user-trained gesture via the QMI8658 IMU |
-| Recording mode | Double-tap BOOT or tap Record on screen to record meetings or memos; compressed chunks are spooled to flash and uploaded in the background |
-| Turn API v1 | `POST /v1/turns` (WAV, 24 kHz mono) → sync `200 audio/wav` or async `202` + poll |
-| Mock server | Python stdlib server that returns canned/echo audio so the round trip is testable without a real backend |
-| Assistant backend | Gateway (EN/PT speech in and out, sessions, inbox, recordings store) in front of a swappable brain. Path A (current): everything goes to Instinct by wacli messaging its number. Path B (alternative): a dedicated Onurb agent that owns context and integrations. |
-| Verification | Host unit tests + mock tests + CI firmware build, then a physical acceptance test plan |
+| Talking to it | Gesture (raise to mouth, on-device model) or button. Each request becomes a **thread** on the watch; you answer a thread by voice, or add to a running one. A red X cancels; a tap on it marks a false gesture trigger (training data) |
+| WhatsApp | Reads your chats (wacli, read-only). Messages you dictate become a WhatsApp-style preview (photo, bubbles, Edit / Cancel / Confirm); sent only on Confirm. **Scheduled sends**: "manda pro X amanhã às 9h": confirm once, the server sends it on time |
+| Background tasks | Long work (research, browsing, watching your terminal agents) runs in the background and the result comes back to the watch |
+| Docs | Lists, reports and research go to **Notion**, under the user's ONURB page, with the link on the watch |
+| herdr | Reads, prompts and answers the user's Claude Code agents in [herdr](gateway/skills/herdr/SKILL.md); approves only read-only lookups |
+| Instinct | Email, groceries, to-dos and reminders go to the user's other assistant, Instinct |
+| Shopping | Researches the main stores, picks one option, stages it at checkout and shows photo, total and reasoning on the watch; buys only on Confirm, under a per-purchase ceiling ([skill](gateway/skills/shopping/SKILL.md)) |
+| Code tasks | "Change how the watch does X": a code agent edits this repo, builds, commits locally, and the watch updates itself over Wi-Fi |
+| Mac → server bridge | Claude Code sessions on the Mac can send files to the server, start sessions there and read them ([remote/](remote/README.md)) |
 
-## Roadmap
+## How it fits together
 
-M0 spec → M1 portable core + mock server → M2 firmware build in CI → M3 hardware bring-up → M4 connectivity field tests → M5 power/thermal → M6 recording mode on hardware → M7 trained gesture. Details are in [SPEC §17](docs/SPEC.md#17-milestones).
+```
+watch ──HTTPS──▶ Cloudflare tunnel ──▶ server gateway (always on)
+  │                                      ├─ while the Mac answers: proxies to the Mac's gateway (Tailscale)
+  │                                      ├─ otherwise: its own agent (no herdr, no Mac-only data)
+  └─ at home: plain HTTP to the Mac      ├─ wacli, its own Chrome, scheduled WhatsApp queue
+                                         └─ firmware image for OTA updates
+Mac gateway ─▶ STT (ElevenLabs Scribe, whisper fallback) ─▶ agent: claude -p, headless, sandboxed
+```
 
-## Configuration and secrets
+| Part | Where | Docs |
+|---|---|---|
+| Firmware (ESP-IDF 5.5, LVGL) | `firmware/` | [SPEC](docs/SPEC.md), [constraints: read before changing it](docs/WATCH_CONSTRAINTS.md) |
+| Gateway (turns, threads, inbox, actions, OTA) | `gateway/onurb_gateway.py` | [AGENT](docs/AGENT.md) |
+| Agent (prompts, tools, tasks, permissions) | `gateway/onurb_agent.py`, `gateway/onurb_mcp.py` | [AGENT_B](docs/AGENT_B.md) |
+| Server (Hetzner, Cloudflare, services, scheduled sends) | `gateway/onurb_schedule.py` | [SERVER](docs/SERVER.md) |
+| Mac → server bridge | `remote/` | [remote/README](remote/README.md) |
+| Gesture model | `tools/gesture_train.py` | [SPEC](docs/SPEC.md) |
 
-All environment-specific values (Wi-Fi, API URL, token) are placeholders set through `idf.py menuconfig`. Never commit real credentials. `sdkconfig` and local overrides are gitignored.
+## Guardrails
+
+- The agent never sends anything itself: WhatsApp and purchases are previews that only the
+  user's Confirm on the watch executes. Email follows Instinct's own confirmation rule.
+- The agent runs in `dontAsk` mode with an explicit tool allowlist (`gateway/onurb_agent.py`),
+  not the user's own settings. Code tasks may touch only this repo, never its secrets, and never push.
+- Keys and per-device values (Wi-Fi, tokens, contact ids, addresses, hosts) live in the
+  gitignored `firmware/sdkconfig` or in `~/.config/onurb/`, never in the repo.
+
+## Build and flash
+
+```sh
+tools/onurb_build.sh                       # builds; the gateways offer it to the watch (OTA)
+. ~/esp/esp-idf/export.sh
+cd firmware && idf.py -p /dev/cu.usbmodem* flash monitor   # first install, or recovery over USB
+```
+
+Settings (Wi-Fi networks, gateway URLs, token) are set with `idf.py menuconfig` into the
+gitignored `sdkconfig`. [`brief.md`](brief.md) is the original brief the project started from.
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
-## Hardware bring-up (current step)
-
-The watch has arrived. `firmware/` holds the first bring-up app, built with ESP-IDF v5.5.5 against the pinned Waveshare BSP. It:
-- configures the battery charger
-- scans the I2C bus
-- brings up the 24 kHz audio profile and plays a test tone
-- lets you hold BOOT to record, then reports per-microphone levels and plays back the recording
-
-```sh
-. ~/esp/esp-idf/export.sh
-tools/backup_factory.sh                  # 1. back up the factory firmware first (16 MB, into backups/)
-cd firmware && idf.py -p /dev/cu.usbmodem* flash monitor   # 2. flash + watch logs
-```

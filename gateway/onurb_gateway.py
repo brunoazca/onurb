@@ -638,6 +638,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/internal/propose_whatsapp":
             r = agent.propose_whatsapp(body.get("to", ""), body.get("messages") or [], turn, body.get("send_at"))
             return self._send(200, json.dumps(r).encode())
+        if self.path == "/internal/remote_done":    # a remote-bridge session (remote/) finished a run
+            r = agent.remote_done(body.get("turn", ""), body.get("title", ""))
+            return self._send(200, json.dumps(r).encode())
         if self.path == "/internal/scheduled":
             return self._send(200, json.dumps(agent.list_scheduled(), ensure_ascii=False).encode())
         if self.path == "/internal/scheduled/cancel":

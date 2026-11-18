@@ -880,6 +880,21 @@ def schedule_call(cmd, item=None, arg=None):
         return {"error": f"server unreachable ({str(e)[:80]})"}
 
 
+def remote_done(turn, title):
+    """A server session started from the Mac (remote/onurb_remote.py) finished a run: if it proposed a
+    WhatsApp message or a purchase, put the preview on the watch (it is sent/bought only on Confirm)."""
+    if not str(turn).startswith("remote-"):
+        return {"error": "bad turn"}
+    with LOCK:
+        action = PROPOSED_BY_TURN.pop(turn, None)
+        if action:
+            INBOX.append((f"Uma sessão do servidor ({str(title)[:60]}) preparou isto pra você confirmar.",
+                          "pt", turn, "", action))
+    if action:
+        log(f"  remote session {turn}: proposal {action} -> watch")
+    return {"action": action}
+
+
 def list_scheduled():
     r = schedule_call("list")
     if "error" in r:
